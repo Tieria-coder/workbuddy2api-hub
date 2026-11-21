@@ -1012,8 +1012,10 @@ async function revealKey(){
 </script>"""
 
 
-def keys_body(user):
-    base = "http://120.55.100.130/wb/v1"
+def keys_body(user, public_base=""):
+    # 站点域名不写死：默认用请求里的 Host，部署在别的域名/端口也能对；
+    # 反向代理改了 Host 时用环境变量 PUBLIC_BASE 覆盖，例如 https://pool.example.com
+    base = (public_base.rstrip("/") if public_base else "") + "/wb/v1"
     with db() as conn:
         row = conn.execute("SELECT * FROM user_keys WHERE uid=?", (user["id"],)).fetchone()
         contribs = conn.execute("SELECT count(*) FROM contrib WHERE uid=?", (user["id"],)).fetchone()[0]
@@ -1143,6 +1145,17 @@ class Handler(BaseHTTPRequestHandler):
                 or (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
                 or self.client_address[0])
 
+    def _public_base(self):
+        """站点对外的地址，用来在页面上写示例；不写死域名。
+
+        PUBLIC_BASE 环境变量优先（反代改了 Host 时用），否则拿请求的 Host。
+        """
+        env = (os.environ.get("PUBLIC_BASE") or "").strip().rstrip("/")
+        if env:
+            return env
+        host = (self.headers.get("Host") or "").strip() or "127.0.0.1"
+        return "http://" + host
+
     # ── GET ──
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
@@ -1202,7 +1215,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/keys":
             if not user:
                 return self._send(302, "", "text/plain", location="/join/")
-            return self._send(200, page("API Key", keys_body(user), user, "keys"))
+            return self._send(200, page("API Key", keys_body(user, self._public_base()), user, "keys"))
         return self._json({"ok": False, "error": "not found"}, 404)
 
     # ── POST ──
