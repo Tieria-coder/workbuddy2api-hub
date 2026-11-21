@@ -1,0 +1,489 @@
+/* WorkBuddy 控制台 · 算力池扩展
+   由 nginx 在 /wb/ 的 HTML 末尾注入，不改第三方镜像。
+   数据来自算力池服务 /join/admin/api/overview，鉴权直接用面板自己的
+   X-Panel-Token —— 能进面板的人才能看，不额外多一个密码。
+   幂等：重复注入只跑一次；面板没有新壳节点时安静退出。 */
+(function () {
+  'use strict';
+  if (window.__poolExtLoaded) return;
+  window.__poolExtLoaded = true;
+
+  var TOKEN_KEY = 'wb-proxy-panel-token';
+  var API_URL = '/join/admin/api/overview';
+  var REFRESH_MS = 20000;
+  var timer = null;
+  var busy = false;
+
+  function token() {
+    // 面板默认把令牌放 sessionStorage（勾了「保持登录」才落 localStorage），两处都要认
+    try {
+      return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY) || '';
+    } catch (e) {
+      try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e2) { return ''; }
+    }
+  }
+
+  function esc(v) {
+    return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function nfmt(v, d) {
+    if (v === null || v === undefined || isNaN(v)) return '—';
+    d = (d === undefined) ? 2 : d;
+    var parts = Number(v).toFixed(d).split('.');
+    parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return parts.join('.');
+  }
+
+  function wan(v) {
+    if (!v && v !== 0) return '—';
+    return v >= 10000 ? nfmt(v / 10000, 1) + ' 万' : nfmt(v, 0);
+  }
+
+  function stat(k, v, s, color) {
+    return '<div><div style="font-size:11px;color:var(--dim);font-weight:600;margin-bottom:4px">' + esc(k) + '</div>'
+      + '<div style="font-size:19px;font-weight:700;letter-spacing:-.4px;font-variant-numeric:tabular-nums;color:' + (color || 'var(--fg)') + '">' + v + '</div>'
+      + (s ? '<div style="font-size:10.5px;color:var(--dim-light);margin-top:2px">' + esc(s) + '</div>' : '')
+      + '</div>';
+  }
+
+  function kpi(k, v, s) {
+    return '<div class="card"><div class="k">' + esc(k) + '</div>'
+      + '<div class="v">' + v + '</div>'
+      + '<div class="s">' + esc(s || '') + '</div></div>';
+  }
+
+  function bar(pct, color) {
+    var w = Math.max(0, Math.min(100, Number(pct) || 0));
+    return '<div style="height:6px;border-radius:999px;background:var(--panel3);overflow:hidden;min-width:64px">'
+      + '<i style="display:block;height:100%;width:' + w + '%;background:' + color + '"></i></div>';
+  }
+
+  function card(title, sub, inner) {
+    return '<div class="card" style="padding:16px 20px;margin-bottom:14px">'
+      + '<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:10px">'
+      + '<span style="font-size:13px;font-weight:700;color:var(--fg)">' + esc(title) + '</span>'
+      + (sub ? '<span style="font-size:11px;color:var(--dim-light)">' + esc(sub) + '</span>' : '')
+      + '</div>' + inner + '</div>';
+  }
+
+  function skeleton() {
+    // 标题和说明由面板顶栏给（setChrome），这里只留操作条，避免同一个标题出现两次
+    return '<div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-bottom:12px">'
+      + '<span id="poolUpdated" style="font-size:11px;color:var(--dim-light)">—</span>'
+      + '<button type="button" class="sec mini" id="poolRefreshBtn">刷新</button>'
+      + '<button type="button" class="sec mini" id="poolCreditsBtn" title="真的去腾讯重取一次余额，约 2-3 秒">刷新余额</button>'
+      + '</div>'
+      + '<div id="poolBody"></div>';
+  }
+
+  function ensureStyle() {
+    if (document.getElementById('poolStyle')) return;
+    var st = document.createElement('style');
+    st.id = 'poolStyle';
+    // 面板老壳层的页脚和上下文条对本页没意义；进本页时收掉，离开时还原
+    st.textContent = 'html.pool-active #nextContent .console-shell > main > footer,'
+      + 'html.pool-active #nextContent .console-shell > main > .console-contextbar{display:none!important}'
+      + 'html.pool-active #poolBody table td{vertical-align:middle}'
+      + 'html.pool-active #poolBody .card .v{white-space:nowrap}';
+    (document.head || document.documentElement).appendChild(st);
+  }
+
+  function table(inner) {
+    return '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch">' + inner + '</div>';
+  }
+
+  function render(d) {
+    var p = d.pool, u = d.users;
+    var html = '';
+
+    html += '<div class="card" style="padding:18px 20px;margin-bottom:14px">'
+      + '<div style="font-size:12px;color:var(--dim)">今天这个池子用了多少</div>'
+      + '<div style="display:flex;align-items:baseline;gap:8px;margin-top:6px;flex-wrap:wrap">'
+      + '<span style="font-size:34px;font-weight:750;letter-spacing:-1.2px;color:var(--accent);font-variant-numeric:tabular-nums">' + nfmt(p.used) + '</span>'
+      + '<span style="font-size:12px;color:var(--dim)">积分 · 今日累计（' + p.requests + ' 次请求 · ' + wan(p.tokens) + ' tokens）</span>'
+      + '</div>'
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">'
+      + stat('今天还能用', nfmt(p.available, 1), '剩余 + 未签到的今日额度', 'var(--accent2)')
+      + stat('池子剩余积分', nfmt(p.remain, 1), '所有账号余额之和')
+      + stat('今日签到到账', '+' + nfmt(p.today_gain, 0), '已经算在剩余里')
+      + stat('未签到待领', '+' + nfmt(p.pending_signin, 0), '还没签到的账号今天还能再领')
+      + (d.expiring ? stat('7 天内到期', nfmt((d.expiring.buckets[2] || {}).credit || 0, 1), '不用掉就作废', 'var(--warn)') : '')
+      + '</div></div>';
+
+    // 快过期的积分：积分包按到期时间从早到晚消耗，这部分是会真被扔掉的
+    if (d.expiring) {
+      var ex = d.expiring;
+      var bstats = '';
+      for (var bi = 0; bi < ex.buckets.length; bi++) {
+        var bb = ex.buckets[bi];
+        bstats += stat(bb.label, nfmt(bb.credit, 1), bb.packages + ' 个包', bb.credit > 0 ? 'var(--warn)' : null);
+      }
+      var erows = '';
+      var nowSec = Date.now() / 1000;
+      for (var ei = 0; ei < ex.soon.length; ei++) {
+        var xi = ex.soon[ei];
+        var hot = (xi.ts - nowSec) < 86400;
+        erows += '<tr><td' + (hot ? ' style="color:var(--bad);font-weight:700"' : '') + '>' + esc(xi.at) + (hot ? ' · 24 小时内' : '') + '</td>'
+          + '<td style="font-variant-numeric:tabular-nums">' + nfmt(xi.remain) + '</td>'
+          + '<td>' + esc(xi.label) + '</td>'
+          + '<td style="color:var(--dim);font-size:11.5px">' + esc(xi.name) + '</td></tr>';
+      }
+      if (!erows) erows = '<tr><td colspan="4" style="color:var(--dim)">目前没有带到期时间的余额</td></tr>';
+      html += card('快过期的积分', '积分包按到期时间从早到晚消耗，这些不用掉就真没了',
+        '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px;margin-bottom:12px">' + bstats + '</div>'
+        + table('<table><tr><th>什么时候过期</th><th>还剩</th><th>账号</th><th>来源</th></tr>' + erows + '</table>')
+        + '<div style="font-size:11px;color:var(--dim-light);margin-top:10px">会过期的包共 ' + ex.open_packages + ' 个、合计 '
+        + nfmt(ex.open_total, 1) + ' 积分；无到期日的长期包不计。</div>');
+    }
+
+    html += '<div class="cards" style="margin-bottom:14px">'
+      + kpi('注册用户', u.total, '在算力池注册过的人')
+      + kpi('今天在用的朋友', u.active, '今天真用过池子的人')
+      + kpi('已领 API Key', u.keys, '领了 key 才算真接入')
+      + kpi('贡献的账号数', u.contribs, '所有人加进来的账号总数')
+      + kpi('池内账号', p.account_count, '当前可用 ' + p.healthy + ' 个')
+      + '</div>';
+
+    // 今日各用户用量
+    var rows = '';
+    var totalUsed = p.used || 0;
+    function shareOf(c) { return totalUsed > 0 ? (c / totalUsed * 100) : 0; }
+    var by = d.user_rows.slice().sort(function (a, b) { return b.credit - a.credit; });
+    for (var i = 0; i < by.length; i++) {
+      var r = by[i];
+      if (!r.requests && !r.credit) continue;
+      rows += '<tr><td>' + esc(r.nickname) + '</td>'
+        + '<td style="font-variant-numeric:tabular-nums">' + nfmt(r.credit) + '</td>'
+        + '<td>' + r.requests + '</td>'
+        + '<td style="color:var(--dim)">' + nfmt(shareOf(r.credit), 1) + '%</td></tr>';
+    }
+    if (!rows) rows = '<tr><td colspan="4" style="color:var(--dim)">今天还没有朋友用</td></tr>';
+    if (d.outside && (d.outside.requests || d.outside.credit)) {
+      rows += '<tr style="color:var(--dim)"><td>站外 Key（管理员自用）</td>'
+        + '<td style="font-variant-numeric:tabular-nums">' + nfmt(d.outside.credit) + '</td>'
+        + '<td>' + d.outside.requests + '</td>'
+        + '<td>' + nfmt(shareOf(d.outside.credit), 1) + '%</td></tr>';
+    }
+    html += card('今日各用户用量', '按每个人自己的 API Key 统计，站外那把不算朋友头上',
+      table('<table><tr><th>用户</th><th>今日积分</th><th>请求数</th><th>占全站</th></tr>' + rows + '</table>'));
+
+    // 注册用户
+    var urows = '';
+    for (var j = 0; j < d.user_rows.length; j++) {
+      var x = d.user_rows[j];
+      urows += '<tr><td>' + esc(x.nickname) + '<div style="font-size:11px;color:var(--dim-light)">' + esc(x.email) + '</div></td>'
+        + '<td>' + x.contrib + ' 个</td>'
+        + '<td>' + (x.has_key ? '<span class="badge ok mini">已领</span>' : '<span class="badge off mini">未领</span>') + '</td>'
+        + '<td style="font-variant-numeric:tabular-nums">' + nfmt(x.credit) + '</td>'
+        + '<td>' + x.requests + '</td>'
+        + '<td style="color:var(--dim);font-size:11.5px;white-space:nowrap">' + esc(x.created) + '</td></tr>';
+    }
+    if (!urows) urows = '<tr><td colspan="6" style="color:var(--dim)">还没有人注册</td></tr>';
+    html += card('注册用户', '谁注册了、加了几个号、今天用了多少', table('<table><tr><th>昵称 / 邮箱</th><th>贡献账号</th><th>Key</th><th>今日积分</th><th>今日请求</th><th>注册时间</th></tr>' + urows + '</table>'));
+
+    // 账号明细
+    var arows = '';
+    for (var k = 0; k < p.accounts.length; k++) {
+      var a = p.accounts[k];
+      var pct = (a.size && a.remain !== null) ? (a.remain / a.size * 100) : 0;
+      var badge = a.need_relogin ? '<span class="badge warn mini">需重新授权</span>'
+        : (!a.enabled ? '<span class="badge off mini">已停用</span>'
+          : (a.cooldown ? '<span class="badge warn mini">冷却中</span>' : '<span class="badge ok mini">正常</span>'));
+      arows += '<tr><td>' + esc(a.label) + '</td>'
+        + '<td style="font-variant-numeric:tabular-nums">' + nfmt(a.remain, 1) + '</td>'
+        + '<td>' + bar(pct, 'var(--accent2)') + '</td>'
+        + '<td style="font-variant-numeric:tabular-nums">' + nfmt(a.today_credit_used) + '</td>'
+        + '<td style="font-size:11.5px;color:var(--dim)">' + (a.checked ? '已签 ' + a.streak + ' 天' : '未签到') + '</td>'
+        + '<td>' + badge + '</td></tr>';
+    }
+    if (!arows) arows = '<tr><td colspan="6" style="color:var(--dim)">池子里还没有账号</td></tr>';
+    html += card('账号明细', '只显示「谁提供的第几号账号」，不暴露账号本身的名字',
+      table('<table><tr><th>账号</th><th>剩余积分</th><th>剩余比例</th><th>今日消耗</th><th>今日签到</th><th>状态</th></tr>' + arows + '</table>')
+      + '<div style="font-size:11px;color:var(--dim-light);margin-top:10px;line-height:1.6">'
+      + 'workbuddy 的额度按周期包发放，每天签到给每个账号补一笔，没有「每天只能用 X」的硬上限。'
+      + '所以「今天还能用」= 现在所有账号的剩余 + 今天还没签到的那些账号能补的额度。'
+      + '平时读的是网关的现成快照（7 毫秒），点右上角「刷新余额」才真的去腾讯重取一次（约 2–3 秒）。</div>');
+
+    if (d.pool.errors && d.pool.errors.length) {
+      html += '<div class="card" style="padding:12px 18px;margin-bottom:14px;border-color:rgba(183,121,31,.35);background:var(--warn-soft)">'
+        + '<span style="font-size:12px;color:var(--warn)">部分数据没读到：' + esc(d.pool.errors.join('；')) + '</span></div>';
+    }
+
+    var body = document.getElementById('poolBody');
+    if (body) body.innerHTML = html;
+    var up = document.getElementById('poolUpdated');
+    if (up) up.textContent = '更新于 ' + (d.now || '刚刚');
+  }
+
+  function fail(msg) {
+    var body = document.getElementById('poolBody');
+    if (!body) return;
+    body.innerHTML = '<div class="card" style="padding:16px 20px">'
+      + '<div style="font-size:13px;font-weight:700;color:var(--bad);margin-bottom:6px">算力池数据没取到</div>'
+      + '<div style="font-size:12px;color:var(--dim);line-height:1.7">' + esc(msg) + '</div>'
+      + '<div style="font-size:11.5px;color:var(--dim-light);margin-top:8px">'
+      + '面板本身没问题；这一步是面板向算力池服务要数据，走的是面板登录后的令牌。</div></div>';
+  }
+
+  function load(force) {
+    var body = document.getElementById('poolBody');
+    if (!body) return;
+    if (busy) return;
+    busy = true;
+    var btn = document.getElementById('poolRefreshBtn');
+    if (btn) { btn.disabled = true; btn.textContent = '刷新中'; }
+    var t = token();
+    if (!t) {
+      busy = false;
+      if (btn) { btn.disabled = false; btn.textContent = '刷新'; }
+      fail('面板还没登录。先在面板输入密码，登录后这里会自动出数。');
+      return;
+    }
+    fetch(API_URL + (force ? '?t=' + Date.now() : ''), {
+      headers: { 'X-Panel-Token': t },
+      cache: 'no-store'
+    }).then(function (r) {
+      if (r.status === 401) throw new Error('401');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (d) {
+      if (!d || !d.ok) throw new Error((d && d.error) || '返回内容不对');
+      render(d);
+    }).catch(function (e) {
+      var m = String(e && e.message || e);
+      if (m === '401') fail('面板会话失效了，刷新页面重新输一次面板密码即可。');
+      else if (m.indexOf('HTTP 404') === 0) fail('没找到 /join/admin/api/overview。请用 http://120.55.100.130/wb/ 打开面板（算力池服务挂在同一个域名的 /join/ 下）。');
+      else fail('请求失败：' + m);
+    }).then(function () {
+      busy = false;
+      if (btn) { btn.disabled = false; btn.textContent = '刷新'; }
+    });
+  }
+
+  // 「刷新余额」：后台逐号去腾讯重取，页面不阻塞，进度从 /refresh-status 拉
+  function pollCredits() {
+    var btn = document.getElementById('poolCreditsBtn');
+    var t = token();
+    fetch('/join/admin/api/refresh-status', { headers: { 'X-Panel-Token': t }, cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var j = (d && d.job) || {};
+        if (j.running) {
+          if (btn) btn.textContent = '刷新中 ' + (j.done || 0) + '/' + (j.total || 0);
+          setTimeout(pollCredits, 700);
+          return;
+        }
+        if (btn) { btn.disabled = false; btn.textContent = '刷新余额'; }
+        load(true);
+      })
+      .catch(function () {
+        if (btn) { btn.disabled = false; btn.textContent = '刷新余额'; }
+      });
+  }
+
+  function refreshCredits() {
+    var btn = document.getElementById('poolCreditsBtn');
+    if (!btn || btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = '刷新中…';
+    fetch('/join/admin/api/credits-refresh', {
+      method: 'POST',
+      headers: { 'X-Panel-Token': token(), 'Content-Type': 'application/json' },
+      body: '{}'
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (d) {
+      if (!d || !d.ok) throw new Error((d && d.error) || '没起来');
+      pollCredits();
+    }).catch(function (e) {
+      btn.disabled = false;
+      btn.textContent = '刷新余额';
+      fail('刷新余额失败：' + (e && e.message || e));
+    });
+  }
+
+  function setChrome(title, desc) {
+    var t1 = document.getElementById('nextPageTitle');
+    var d1 = document.getElementById('nextPageDesc');
+    if (t1) t1.textContent = title;
+    if (d1) d1.textContent = desc;
+    var c = document.getElementById('consoleCurrentPage');
+    if (c) c.textContent = title;
+  }
+
+  function markNav(on) {
+    var items = document.querySelectorAll('#nextNav .next-nav-item, #nextBottomNav button, .main-nav .main-nav-btn, .main-nav .console-nav-link');
+    for (var i = 0; i < items.length; i++) {
+      var el = items[i];
+      if (el.id === 'poolNavBtn' || el.id === 'poolBottomBtn') continue;
+      el.classList.remove('active');
+      el.removeAttribute('aria-current');
+    }
+    var ids = ['poolNavBtn', 'poolBottomBtn'];
+    for (var j = 0; j < ids.length; j++) {
+      var mine = document.getElementById(ids[j]);
+      if (!mine) continue;
+      mine.classList.toggle('active', !!on);
+      if (on) mine.setAttribute('aria-current', 'page');
+      else mine.removeAttribute('aria-current');
+    }
+  }
+
+  function goPool() {
+    var page = document.getElementById('pagePool');
+    if (!page) return;
+    var all = document.querySelectorAll('.main-page');
+    for (var i = 0; i < all.length; i++) all[i].classList.remove('active');
+    page.classList.add('active');
+    document.documentElement.classList.add('pool-active');
+    markNav(true);
+    setChrome('算力池', '朋友的账号都并在这里，共用一个额度；今日用了多少、谁在用，一屏看完。');
+    if (typeof window.nextOpenSidebar === 'function') { try { window.nextOpenSidebar(false); } catch (e) { } }
+    load(false);
+    try { window.scrollTo(0, 0); } catch (e) { }
+  }
+  window.__poolGo = goPool;
+
+  function wrapRouter() {
+    if (typeof window.switchMainTab === 'function' && !window.switchMainTab.__poolWrapped) {
+      var orig = window.switchMainTab;
+      var w = function (tab) {
+        if (tab === 'pool') { goPool(); return; }
+        var page = document.getElementById('pagePool');
+        if (page) page.classList.remove('active');
+        document.documentElement.classList.remove('pool-active');
+        markNav(false);
+        return orig.apply(this, arguments);
+      };
+      w.__poolWrapped = true;
+      window.switchMainTab = w;
+    }
+    if (typeof window.nextGo === 'function' && !window.nextGo.__poolWrapped) {
+      var origGo = window.nextGo;
+      var wg = function (tab) {
+        if (tab === 'pool') { goPool(); return; }
+        var page = document.getElementById('pagePool');
+        if (page) page.classList.remove('active');
+        document.documentElement.classList.remove('pool-active');
+        return origGo.apply(this, arguments);
+      };
+      wg.__poolWrapped = true;
+      window.nextGo = wg;
+    }
+  }
+
+  function addNav() {
+    if (document.getElementById('poolNavBtn')) return;
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'poolNavBtn';
+    btn.setAttribute('data-pool-nav', '1');
+    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">'
+      + '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>'
+      + '<span>算力池</span>';
+    btn.addEventListener('click', function (ev) { if (ev) ev.preventDefault(); goPool(); });
+
+    var nav = document.getElementById('nextNav');
+    if (nav) {
+      btn.className = 'next-nav-item';
+      var anchor = nav.querySelector('[data-next-tab="analytics"]') || nav.querySelector('[data-next-tab="accounts"]');
+      if (anchor && anchor.parentNode === nav) nav.insertBefore(btn, anchor.nextSibling);
+      else nav.appendChild(btn);
+      return;
+    }
+    var legacy = document.querySelector('.main-nav');
+    if (legacy) {
+      btn.className = 'main-nav-btn';
+      legacy.appendChild(btn);
+      return;
+    }
+    var bottom = document.getElementById('nextBottomNav');
+    if (bottom) {
+      var sample = bottom.querySelector('button');
+      btn.className = sample ? sample.className : 'next-bottom-item';
+      var more = bottom.querySelector('#nextMoreBtn') || bottom.lastElementChild;
+      if (more && more.parentNode === bottom) bottom.insertBefore(btn, more);
+      else bottom.appendChild(btn);
+    }
+  }
+
+  // 手机端底部导航是面板运行时生成的，晚一步再补一次
+  function addBottomNav() {
+    var bottom = document.getElementById('nextBottomNav');
+    if (!bottom || document.getElementById('poolBottomBtn')) return;
+    var sample = bottom.querySelector('button');
+    if (!sample) return;
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.id = 'poolBottomBtn';
+    b.className = sample.className;
+    b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">'
+      + '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span>池子</span>';
+    b.addEventListener('click', function (ev) { if (ev) ev.preventDefault(); goPool(); });
+    var more = bottom.querySelector('#nextMoreBtn') || bottom.lastElementChild;
+    if (more && more.parentNode === bottom) bottom.insertBefore(b, more);
+    else bottom.appendChild(b);
+  }
+
+  function buildPage() {
+    if (document.getElementById('pagePool')) return;
+    var page = document.createElement('div');
+    page.id = 'pagePool';
+    page.className = 'main-page';
+    page.innerHTML = skeleton();
+    var anchorPage = document.getElementById('pageOverview') || document.getElementById('pageGateway');
+    var host = (anchorPage && anchorPage.parentNode) || document.getElementById('nextContent') || document.body;
+    host.appendChild(page);
+    var btn = document.getElementById('poolRefreshBtn');
+    if (btn) btn.addEventListener('click', function () { load(true); });
+    var cbtn = document.getElementById('poolCreditsBtn');
+    if (cbtn) cbtn.addEventListener('click', function () { refreshCredits(); });
+  }
+
+  function tick() {
+    var page = document.getElementById('pagePool');
+    if (!page || !page.classList.contains('active')) return;
+    if (document.visibilityState && document.visibilityState !== 'visible') return;
+    load(false);
+  }
+
+  function boot() {
+    if (!document.getElementById('nextShell') && !document.querySelector('.main-nav')) return;
+    ensureStyle();
+    buildPage();
+    addNav();
+    addBottomNav();
+    wrapRouter();
+    if (timer) clearInterval(timer);
+    timer = setInterval(tick, REFRESH_MS);
+    var page = document.getElementById('pagePool');
+    if (page && page.classList.contains('active')) load(false);
+    if (!boot.__resize) {
+      boot.__resize = true;
+      var t = null;
+      window.addEventListener('resize', function () {
+        if (t) clearTimeout(t);
+        t = setTimeout(function () {
+          addBottomNav();
+          var pg = document.getElementById('pagePool');
+          if (pg && pg.classList.contains('active')) load(true);
+        }, 400);
+      });
+    }
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(boot, 0); });
+  else setTimeout(boot, 0);
+
+  // 面板可能在登录后重建 DOM（闸门收起），再兜一次
+  setTimeout(function () {
+    try {
+      if (!document.getElementById('poolNavBtn')) boot();
+      else addBottomNav();
+    } catch (e) { }
+  }, 2500);
+})();
