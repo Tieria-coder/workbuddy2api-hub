@@ -1,0 +1,12 @@
+[
+  {"id": "workbuddy", "name": "WorkBuddy", "base": "http://127.0.0.1:8788",
+   "pass_file": "/opt/join-panel/panel-pass", "enabled": true, "note": "国际/国内双区"},
+
+  {"id": "qoder", "name": "Qoder", "base": "http://127.0.0.1:8817",
+   "pass_file": "/opt/join-panel/qoder-pass", "enabled": false,
+   "note": "未接入：起 qoder2api-hub 后把 enabled 改 true"},
+
+  {"id": "trae", "name": "Trae", "base": "http://127.0.0.1:8816",
+   "pass_file": "/opt/join-panel/trae-pass", "enabled": false,
+   "note": "未接入：起 trae2api-hub 后把 enabled 改 true"}
+]

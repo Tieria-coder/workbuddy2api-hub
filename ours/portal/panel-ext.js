@@ -147,6 +147,31 @@
       + kpi('池内账号', p.account_count, '当前可用 ' + p.healthy + ' 个')
       + '</div>';
 
+    // 多平台：几家网关的数字摆在一块看
+    if (d.upstreams && d.upstreams.items && d.upstreams.items.length) {
+      var urows = '';
+      for (var ui = 0; ui < d.upstreams.items.length; ui++) {
+        var it = d.upstreams.items[ui];
+        var ok = it.state === 'ok';
+        var badge = ok ? '<span class="badge ok mini">在线</span>'
+          : (it.state === 'off' ? '<span class="badge off mini">未接入</span>'
+            : '<span class="badge warn mini">读取失败</span>');
+        urows += '<tr><td>' + esc(it.name)
+          + (it.note ? '<div style="font-size:11px;color:var(--dim-light)">' + esc(it.note) + '</div>' : '')
+          + '</td><td>' + badge + '</td>'
+          + '<td>' + (ok ? it.accounts + '（可用 ' + it.healthy + '）' : '—') + '</td>'
+          + '<td style="font-variant-numeric:tabular-nums">' + (ok ? nfmt(it.used) : '—') + '</td>'
+          + '<td>' + (ok ? it.requests : '—') + '</td>'
+          + '<td style="font-variant-numeric:tabular-nums">' + (ok ? nfmt(it.remain, 1) : '—') + '</td></tr>';
+      }
+      var ut = d.upstreams.total;
+      urows += '<tr><td><b>合计</b></td><td></td><td>' + ut.accounts + '</td><td>' + nfmt(ut.used, 1)
+        + '</td><td>' + ut.requests + '</td><td>' + nfmt(ut.remain, 1) + '</td></tr>';
+      html += card('多平台', '几家网关摆在一块看；合计那行只算已接入的',
+        table('<table><tr><th>平台</th><th>状态</th><th>账号</th><th>今日消耗</th><th>今日请求</th><th>剩余积分</th></tr>'
+          + urows + '</table>'));
+    }
+
     // 今日各用户用量
     var rows = '';
     var totalUsed = p.used || 0;

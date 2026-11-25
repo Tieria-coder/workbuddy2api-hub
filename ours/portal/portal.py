@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM = "http://127.0.0.1:8788"
 PASS_FILE = "/opt/join-panel/panel-pass"
+UPSTREAMS_FILE = "/opt/join-panel/upstreams.json"
 DB = "/opt/join-panel/portal.db"
 PANEL_JS = "/opt/join-panel/panel-ext.js"
 LOG_FILE = "/var/log/join-panel.log"
@@ -336,6 +337,134 @@ def expiry_watch(pkgs):
     }
 
 
+# ── 多上游：把几家网关的数字摆在同一页 ─────────────────────────────
+# 配置文件 /opt/join-panel/upstreams.json 是一个数组，每项：
+#   {"id","name","base","pass_file","enabled","note",
+#    "auth_header","auth_prefix","login_path","login_field"}
+# 后四个是给别的家族的网关留的适配位（默认 X-Panel-Token + /panel/login + password）。
+DEFAULT_UPSTREAMS = [{
+    "id": "workbuddy", "name": "WorkBuddy", "base": UPSTREAM,
+    "pass_file": PASS_FILE, "enabled": True, "note": "国际/国内双区",
+}]
+_up_tokens = {}
+_up_cache = {"at": 0.0, "data": None}
+_up_lock = threading.Lock()
+
+
+def load_upstreams():
+    try:
+        with open(UPSTREAMS_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return DEFAULT_UPSTREAMS
+    except Exception as exc:
+        log("upstreams.json unreadable: %s" % exc)
+        return DEFAULT_UPSTREAMS
+    out = []
+    for e in raw if isinstance(raw, list) else []:
+        if not isinstance(e, dict) or not e.get("base"):
+            continue
+        out.append({
+            "id": str(e.get("id") or e.get("name") or "up"),
+            "name": str(e.get("name") or e.get("id") or "up"),
+            "base": str(e["base"]).rstrip("/"),
+            "pass_file": str(e.get("pass_file") or ""),
+            "note": str(e.get("note") or ""),
+            "enabled": bool(e.get("enabled", True)),
+            "auth_header": str(e.get("auth_header") or "X-Panel-Token"),
+            "auth_prefix": str(e.get("auth_prefix") or ""),
+            "login_path": str(e.get("login_path") or "/panel/login"),
+            "login_field": str(e.get("login_field") or "password"),
+        })
+    return out or DEFAULT_UPSTREAMS
+
+
+def _up_token(e, force=False):
+    key = e["base"]
+    if not force and _up_tokens.get(key):
+        return _up_tokens[key]
+    if not e["pass_file"]:
+        raise RuntimeError("未配置面板密码文件")
+    try:
+        pw = open(e["pass_file"], encoding="utf-8").read().strip()
+    except OSError:
+        raise RuntimeError("读不到面板密码文件")
+    if not pw:
+        raise RuntimeError("面板密码文件是空的")
+    req = urllib.request.Request(
+        e["base"] + e["login_path"],
+        data=json.dumps({e["login_field"]: pw}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        tok = json.loads(r.read().decode()).get("token")
+    if not tok:
+        raise RuntimeError("面板登录没拿到 token")
+    _up_tokens[key] = tok
+    return tok
+
+
+def _up_get(e, path, query=None):
+    url = e["base"] + path + ("?" + urllib.parse.urlencode(query) if query else "")
+
+    def once(tok):
+        hdr = {e["auth_header"]: (e["auth_prefix"] + tok).strip()}
+        req = urllib.request.Request(url, headers=hdr)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode())
+
+    try:
+        return once(_up_token(e))
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401:
+            raise
+        return once(_up_token(e, force=True))
+
+
+def upstreams_overview(ttl=15):
+    """每家上游一份摘要：账号数、健康数、今日用量、剩余积分；失败的单独标出来。"""
+    with _up_lock:
+        if _up_cache["data"] is not None and time.time() - _up_cache["at"] < ttl:
+            return _up_cache["data"]
+        items = []
+        for e in load_upstreams():
+            base = {"id": e["id"], "name": e["name"], "note": e["note"]}
+            if not e["enabled"]:
+                items.append(dict(base, state="off", accounts=0, healthy=0,
+                                  used=0.0, requests=0, remain=0.0))
+                continue
+            try:
+                acc = _up_get(e, "/accounts").get("accounts") or []
+                an = _up_get(e, "/usage/analytics", {"range": "today", "realm": "cn"})
+                w = (an.get("summary") or {}).get("window") or {}
+                remain = 0.0
+                for a in acc:
+                    r0 = (a.get("credits") or {}).get("remain")
+                    if isinstance(r0, (int, float)):
+                        remain += r0
+                healthy = sum(1 for a in acc
+                              if a.get("enabled", True) and not a.get("needRelogin")
+                              and not a.get("tokenExpired") and not a.get("inCooldown"))
+                items.append(dict(base, state="ok", accounts=len(acc), healthy=healthy,
+                                  used=round(w.get("credit") or 0, 2),
+                                  requests=int(w.get("requests") or 0),
+                                  remain=round(remain, 2)))
+            except Exception as exc:
+                log("upstream %s failed: %s" % (e["id"], exc))
+                items.append(dict(base, state="error", accounts=0, healthy=0,
+                                  used=0.0, requests=0, remain=0.0,
+                                  error=str(exc)[:100]))
+        total = {
+            "accounts": sum(i["accounts"] for i in items),
+            "used": round(sum(i["used"] for i in items), 2),
+            "requests": sum(i["requests"] for i in items),
+            "remain": round(sum(i["remain"] for i in items), 2),
+        }
+        data = {"items": items, "total": total}
+        _up_cache["data"] = data
+        _up_cache["at"] = time.time()
+        return data
+
+
 def account_list():
     """账号快照，展示用数字一律走这里。
 
@@ -530,6 +659,7 @@ def overview_data():
         "user_rows": user_rows,
         "outside": {"credit": round(outside["credit"], 2), "requests": outside["requests"]},
         "expiring": expiring,
+        "upstreams": upstreams_overview(),
     }
 
 
@@ -818,6 +948,29 @@ def dashboard_body(user):
                 '<div class="l">%s（%d 个包）</div></div>'
                 % (b["credit"], label, b["packages"]))
 
+    # 多平台总览：同一个页面把各家网关的数字摆在一起
+    up = upstreams_overview()
+    up_rows = ""
+    for it in up["items"]:
+        if it["state"] == "ok":
+            pill = '<span class="pill ok">在线</span>'
+            nums = ("<td>%d（可用 %d）</td><td>%.1f</td><td>%d</td><td>%.1f</td>"
+                    % (it["accounts"], it["healthy"], it["used"], it["requests"], it["remain"]))
+        elif it["state"] == "off":
+            pill = '<span class="pill">未接入</span>'
+            nums = '<td>—</td><td>—</td><td>—</td><td>—</td>'
+        else:
+            pill = '<span class="pill warn">读取失败</span>'
+            nums = ('<td>—</td><td>—</td><td>—</td><td>—</td>')
+        up_rows += ("<tr><td>%s<div class=\"hint\" style=\"margin:2px 0 0;min-height:0\">%s</div></td>"
+                    "<td>%s</td>%s</tr>"
+                    % (it["name"], it.get("note") or "", pill, nums))
+    up_total = up["total"]
+    up_note = ""
+    if any(i["state"] in ("off", "error") for i in up["items"]):
+        up_note = ('<div class="hint">灰色的那几家还没接网关，所以只有占位；接上后同一个页面自动出数。'
+                   '在 <code>/opt/join-panel/upstreams.json</code> 里加一条就能多一家。</div>')
+
     return f"""
 <div class="card">
   <div class="sub" style="margin-bottom:2px">今天这个池子用了多少</div>
@@ -829,6 +982,16 @@ def dashboard_body(user):
     <div class="stat"><div class="n">{available_today:,.1f}</div><div class="l">今天还能用（剩余+签到）</div></div>
   </div>
   {note}
+</div>
+<div class="card">
+  <h2>多平台总览</h2>
+  <div class="sub" style="margin:0 0 10px">几家网关的数字摆在一块看；合计那行只算已接入的。</div>
+  <table>
+    <tr><th>平台</th><th>状态</th><th>账号</th><th>今日消耗</th><th>今日请求</th><th>剩余积分</th></tr>
+    {up_rows}
+    <tr><td><b>合计</b></td><td></td><td>{up_total['accounts']}</td><td>{up_total['used']:,.1f}</td><td>{up_total['requests']}</td><td>{up_total['remain']:,.1f}</td></tr>
+  </table>
+  {up_note}
 </div>
 <div class="card">
   <h2>快过期的积分</h2>

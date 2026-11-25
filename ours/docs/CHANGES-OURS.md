@@ -56,3 +56,26 @@
 - nginx：`/etc/nginx/sites-available/default.bak-ours-*`，删掉 `/wb/` 里三行 `sub_filter` 即回到原样
 - portal：`/opt/join-panel/portal.py.bak-*`
 - 一条命令：`sudo bash ours/deploy/install.sh --rollback`
+
+## 6. 多平台：几家网关的数字摆在一块
+
+配置文件 `/opt/join-panel/upstreams.json` 是一个数组，每项一家网关（样例见
+`ours/deploy/upstreams.example.json`）：
+
+```json
+{"id": "workbuddy", "name": "WorkBuddy", "base": "http://127.0.0.1:8788",
+ "pass_file": "/opt/join-panel/panel-pass", "enabled": true, "note": "国际/国内双区"}
+```
+
+- `enabled: false` 的那家显示成灰的「未接入」，不阻塞其它家
+- 读取失败只把那一行标成「读取失败」，合计行只算正常接通的
+- 跨家族网关（qoder2api-hub / trae2api-hub 之类）认证头不一样时，用
+  `auth_header` / `auth_prefix` / `login_path` / `login_field` 适配，
+  默认是 `X-Panel-Token` + `/panel/login` + `password`
+
+页面效果：`/join/dashboard` 多一张「多平台总览」，面板「算力池」页多一张「多平台」，
+同一份数据（15 秒缓存），合计行只算已接入的。
+
+实测（2026-11-25）：WorkBuddy 一家在线（5 个号、今日 203.4 积分、剩余 17,626），
+Qoder 与 Trae 按未接入显示占位；面板页与朋友页都验过，18 项回归全过。
+
