@@ -403,13 +403,15 @@ def _up_token(e, force=False):
     return tok
 
 
-def _up_get(e, path, query=None):
+def _up_call(e, method, path, payload=None, query=None, timeout=30):
     url = e["base"] + path + ("?" + urllib.parse.urlencode(query) if query else "")
+    body = json.dumps(payload).encode() if payload is not None else None
 
     def once(tok):
-        hdr = {e["auth_header"]: (e["auth_prefix"] + tok).strip()}
-        req = urllib.request.Request(url, headers=hdr)
-        with urllib.request.urlopen(req, timeout=20) as r:
+        hdr = {e["auth_header"]: (e["auth_prefix"] + tok).strip(),
+               "Content-Type": "application/json"}
+        req = urllib.request.Request(url, data=body, headers=hdr, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
 
     try:
@@ -418,6 +420,101 @@ def _up_get(e, path, query=None):
         if exc.code != 401:
             raise
         return once(_up_token(e, force=True))
+
+
+def _up_get(e, path, query=None):
+    return _up_call(e, "GET", path, None, query)
+
+
+def _up_post(e, path, payload=None):
+    return _up_call(e, "POST", path, payload if payload is not None else {})
+
+
+def up_by_id(uid):
+    for e in load_upstreams():
+        if e["id"] == uid:
+            return e
+    return None
+
+
+def platform_detail(e):
+    """一家平台的账号明细（管理视角，显示昵称；朋友那页仍然是匿名的）。"""
+    out = {"id": e["id"], "name": e["name"], "note": e["note"],
+           "state": "ok", "accounts": [], "usage": {"used": 0.0, "requests": 0}}
+    try:
+        data = _up_get(e, "/accounts")
+        rows = []
+        for a in data.get("accounts") or []:
+            c = a.get("credits") or {}
+            ck = c.get("checkin") or {}
+            rows.append({
+                "uid": a.get("uid") or "",
+                "nickname": a.get("nickname") or "（无昵称）",
+                "remain": c.get("remain"),
+                "size": c.get("size"),
+                "checked": bool(ck.get("today_checked_in")),
+                "streak": ck.get("streak_days") or 0,
+                "today_credit": ck.get("today_credit") or 0,
+                "need_relogin": bool(a.get("needRelogin") or a.get("tokenExpired")),
+                "cooldown": bool(a.get("inCooldown")),
+                "enabled": bool(a.get("enabled", True)),
+            })
+        out["accounts"] = rows
+        try:
+            an = _up_get(e, "/usage/analytics", {"range": "today", "realm": "cn"})
+            w = (an.get("summary") or {}).get("window") or {}
+            out["usage"] = {"used": round(w.get("credit") or 0, 2),
+                            "requests": int(w.get("requests") or 0)}
+        except Exception:
+            pass
+    except Exception as exc:
+        log("platform %s detail failed: %s" % (e["id"], exc))
+        out["state"] = "error"
+        out["error"] = str(exc)[:120]
+    return out
+
+
+def platform_checkin(e, uid=None):
+    payload = {"uid": uid} if uid else {}
+    r = _up_post(e, "/accounts/checkin", payload)
+    res = r.get("results") or []
+    ok = sum(1 for x in res if x.get("ok"))
+    return {"ok": True, "checked": ok, "total": len(res),
+            "message": r.get("message") or r.get("msg") or ""}
+
+
+LOGIN_START_PAYLOADS = ({"platform": "CLI", "realm": "cn"}, {})
+
+
+def platform_login_start(e):
+    """不同家族的发号接口形状不一样：先试带 platform 的，再试空体；
+    链接字段也兼容 authUrl / authorization_url。"""
+    last = ""
+    for pl in LOGIN_START_PAYLOADS:
+        try:
+            r = _up_post(e, "/accounts/login/start", pl)
+        except Exception as exc:
+            last = str(exc)[:120]
+            continue
+        st = str(r.get("status") or "").lower()
+        if st in ("failed", "error"):
+            last = json.dumps(r, ensure_ascii=False)[:150]
+            continue
+        url = r.get("authUrl") or r.get("authorization_url") or r.get("url")
+        state = r.get("state")
+        if url and state:
+            return {"ok": True, "state": state, "authUrl": url}
+        last = json.dumps(r, ensure_ascii=False)[:150]
+    return {"ok": False, "error": last or "上游没给授权链接"}
+
+
+def platform_login_poll(e, state):
+    try:
+        r = _up_get(e, "/accounts/login/poll", {"state": state})
+    except Exception:
+        r = _up_post(e, "/accounts/login/poll", {"state": state})
+    return {"ok": True, "status": str(r.get("status") or "unknown"),
+            "message": str(r.get("message") or "")[:160]}
 
 
 def upstreams_overview(ttl=15):
@@ -1359,6 +1456,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "panel auth required"}, 401)
             return self._json({"ok": True, "job": credits_job_state()})
 
+        if path == "/admin/api/platforms":
+            tok = self.headers.get("X-Panel-Token") or ""
+            if not (panel_ok(tok) or is_admin(user)):
+                return self._json({"ok": False, "error": "panel auth required"}, 401)
+            items = []
+            for e in load_upstreams():
+                if e["enabled"]:
+                    items.append(platform_detail(e))
+                else:
+                    items.append({"id": e["id"], "name": e["name"], "note": e["note"],
+                                  "state": "off", "accounts": [],
+                                  "usage": {"used": 0.0, "requests": 0}})
+            return self._json({"ok": True, "platforms": items})
+
         if path in ("/", "/join", ""):
             if user:
                 return self._send(302, "", "text/plain", location="/join/dashboard")
@@ -1401,6 +1512,28 @@ class Handler(BaseHTTPRequestHandler):
                 log("credits refresh start failed: %s" % exc)
                 return self._json({"ok": False, "error": "起不来：%s" % str(exc)[:120]}, 502)
             return self._json({"ok": True, "job": st})
+
+        if path.startswith("/admin/api/platform/"):
+            tok = self.headers.get("X-Panel-Token") or ""
+            if not (panel_ok(tok) or is_admin(self._cookie_uid())):
+                return self._json({"ok": False, "error": "panel auth required"}, 401)
+            action = path[len("/admin/api/platform/"):]
+            e = up_by_id(str(body.get("id") or ""))
+            if not e:
+                return self._json({"ok": False, "error": "没有这家平台"}, 404)
+            if not e["enabled"]:
+                return self._json({"ok": False, "error": "%s 还没接入" % e["name"]}, 400)
+            try:
+                if action == "checkin":
+                    return self._json(platform_checkin(e, body.get("uid")))
+                if action == "login-start":
+                    return self._json(platform_login_start(e))
+                if action == "login-poll":
+                    return self._json(platform_login_poll(e, str(body.get("state") or "")))
+            except Exception as exc:
+                log("platform %s %s failed: %s" % (e["id"], action, exc))
+                return self._json({"ok": False, "error": str(exc)[:120]}, 502)
+            return self._json({"ok": False, "error": "unknown action"}, 404)
 
         if path == "/api/register":
             log(f"register attempt email={body.get('email')!r} ip={ip}")

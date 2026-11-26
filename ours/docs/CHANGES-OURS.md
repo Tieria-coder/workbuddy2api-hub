@@ -79,3 +79,20 @@
 实测（2026-11-25）：WorkBuddy 一家在线（5 个号、今日 203.4 积分、剩余 17,626），
 Qoder 与 Trae 按未接入显示占位；面板页与朋友页都验过，18 项回归全过。
 
+
+## 7. 一个面板管三家（2026-11-26 加）
+
+面板「算力池」页多一张「平台管理」：tab 切 WorkBuddy / Qoder / Trae，每家一屏——
+
+- 账号表：昵称、剩余积分、今日签到（连签天数）、状态（正常/冷却中/需重新授权/已停用）
+- 「签到」单号｜「全部签到」批量
+- 「添加账号」：门户代发 `POST /accounts/login/start`，把官方授权链接直接给出来，
+  每 3 秒轮询 `login/poll`，成功自动刷新（不用再去各家的 127.0.0.1 看板）
+
+后端只加了三类透传接口（都要面板令牌）：`/admin/api/platforms`、
+`/admin/api/platform/checkin`、`/admin/api/platform/login-start|login-poll`。
+不同家族的发号体不一样，做了适配：先试 `{"platform":"CLI","realm":"cn"}`，失败再试 `{}`；
+链接字段兼容 `authUrl` / `authorization_url`；轮询先 GET 再 POST。
+
+实测：三家 tab 切换正常，WorkBuddy 5 个号明细/签到/连签天数都对，Qoder 与 Trae 空态提示正确；
+门户代发两家的授权链接都拿到了（qoder.com.cn 设备码、trae.cn authorization）。

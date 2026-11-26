@@ -95,6 +95,167 @@
     return '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch">' + inner + '</div>';
   }
 
+  // ── 平台管理：三家共用一套界面 ─────────────────────────────
+  var plat = { data: null, at: 0, tab: '', poll: null };
+
+  function platAction(action, body) {
+    return fetch('/join/admin/api/platform/' + action, {
+      method: 'POST',
+      headers: { 'X-Panel-Token': token(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {})
+    }).then(function (r) {
+      if (r.status === 401) throw new Error('面板会话失效');
+      return r.json();
+    });
+  }
+
+  function loadPlatforms(force) {
+    if (!force && plat.data && Date.now() - plat.at < 10000) { renderPlatformTabs(); return; }
+    fetch('/join/admin/api/platforms', { headers: { 'X-Panel-Token': token() }, cache: 'no-store' })
+      .then(function (r) {
+        if (r.status === 401) throw new Error('面板会话失效');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (d) {
+        plat.data = d.platforms || [];
+        plat.at = Date.now();
+        if (!plat.tab && plat.data.length) plat.tab = plat.data[0].id;
+        renderPlatformTabs();
+      })
+      .catch(function (e) {
+        var b = document.getElementById('poolPlatformBody');
+        if (b) b.innerHTML = '<span style="color:var(--bad)">平台明细取不到：' + esc(e.message) + '</span>';
+      });
+  }
+
+  function renderPlatformTabs() {
+    var tabs = document.getElementById('poolPlatformTabs');
+    var body = document.getElementById('poolPlatformBody');
+    if (!tabs || !body) return;
+    var h = '';
+    for (var i = 0; i < (plat.data || []).length; i++) {
+      var p = plat.data[i];
+      var label = p.name;
+      if (p.state === 'ok') label += ' · ' + p.accounts.length + ' 个号';
+      else if (p.state === 'off') label += ' · 未接入';
+      else label += ' · 读取失败';
+      var on = p.id === plat.tab;
+      h += '<button type="button" class="sec mini" data-plat="' + esc(p.id) + '"'
+        + (on ? ' style="border-color:var(--accent);color:var(--accent)"' : '') + '>' + esc(label) + '</button>';
+    }
+    tabs.innerHTML = h;
+    var btns = tabs.querySelectorAll('[data-plat]');
+    for (var j = 0; j < btns.length; j++) {
+      btns[j].addEventListener('click', function () {
+        plat.tab = this.getAttribute('data-plat');
+        renderPlatformTabs();
+      });
+    }
+    renderPlatformBody();
+  }
+
+  function renderPlatformBody() {
+    var body = document.getElementById('poolPlatformBody');
+    if (!body) return;
+    var p = null;
+    for (var i = 0; i < (plat.data || []).length; i++) if (plat.data[i].id === plat.tab) p = plat.data[i];
+    if (!p) { body.innerHTML = '<span style="color:var(--dim)">没有可选的平台</span>'; return; }
+    if (p.state === 'off') {
+      body.innerHTML = '<div style="color:var(--dim)">' + esc(p.name)
+        + ' 还没接入。在 <code>/opt/join-panel/upstreams.json</code> 里把它的 enabled 改成 true。</div>';
+      return;
+    }
+    if (p.state === 'error') {
+      body.innerHTML = '<div style="color:var(--bad)">' + esc(p.name) + ' 读取失败：' + esc(p.error || '') + '</div>';
+      return;
+    }
+
+    var rows = '';
+    for (var k = 0; k < p.accounts.length; k++) {
+      var a = p.accounts[k];
+      var badge = a.need_relogin ? '<span class="badge warn mini">需重新授权</span>'
+        : (!a.enabled ? '<span class="badge off mini">已停用</span>'
+          : (a.cooldown ? '<span class="badge warn mini">冷却中</span>' : '<span class="badge ok mini">正常</span>'));
+      rows += '<tr><td>' + esc(a.nickname) + '</td>'
+        + '<td style="font-variant-numeric:tabular-nums">' + (a.remain === null ? '—' : nfmt(a.remain, 1)) + '</td>'
+        + '<td>' + (a.checked ? '已签 ' + a.streak + ' 天' : '<span style="color:var(--warn)">未签到</span>') + '</td>'
+        + '<td>' + badge + '</td>'
+        + '<td><button type="button" class="sec mini" data-checkin="' + esc(a.uid) + '">签到</button></td></tr>';
+    }
+    if (!rows) rows = '<tr><td colspan="5" style="color:var(--dim)">这家还没有账号，点下面的「添加账号」授权一个</td></tr>';
+
+    body.innerHTML = '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">'
+      + '<button type="button" class="sec mini" id="platAddBtn">添加账号</button>'
+      + '<button type="button" class="sec mini" id="platCheckAll">全部签到</button>'
+      + '<span id="platMsg" style="font-size:11.5px;color:var(--dim)"></span></div>'
+      + '<div id="platAuth"></div>'
+      + table('<table><tr><th>账号</th><th>剩余积分</th><th>今日签到</th><th>状态</th><th></th></tr>' + rows + '</table>')
+      + '<div style="font-size:11px;color:var(--dim-light);margin-top:8px">今日消耗 ' + nfmt(p.usage.used)
+      + ' 积分 · ' + p.usage.requests + ' 次请求；这是管理视角，朋友那页仍然匿名。</div>';
+
+    var msg = document.getElementById('platMsg');
+    function say(text, bad) {
+      if (!msg) return;
+      msg.textContent = text || '';
+      msg.style.color = bad ? 'var(--bad)' : 'var(--dim)';
+    }
+
+    var addBtn = document.getElementById('platAddBtn');
+    if (addBtn) addBtn.addEventListener('click', function () {
+      say('正在申请授权链接…');
+      platAction('login-start', { id: p.id }).then(function (d) {
+        if (!d.ok) { say(d.error || '申请失败', true); return; }
+        var box = document.getElementById('platAuth');
+        box.innerHTML = '<div style="margin:6px 0 10px"><a class="link" target="_blank" rel="noopener" href="'
+          + esc(d.authUrl) + '">打开 ' + esc(p.name) + ' 官方授权页 →</a>'
+          + '<div style="font-size:11.5px;color:var(--dim);margin-top:4px">在上面登录并同意后，这里会自动变成「已加入」；本页别关。</div></div>';
+        say('等你完成授权…');
+        var n = 0;
+        if (plat.poll) clearInterval(plat.poll);
+        plat.poll = setInterval(function () {
+          n++;
+          platAction('login-poll', { id: p.id, state: d.state }).then(function (r) {
+            if (r.status === 'ok') {
+              clearInterval(plat.poll); plat.poll = null;
+              say('已加入'); loadPlatforms(true); load(true);
+            } else if (r.status === 'expired' || r.status === 'error') {
+              clearInterval(plat.poll); plat.poll = null;
+              say('授权没走完：' + (r.message || r.status), true);
+            } else if (n >= 40) {
+              clearInterval(plat.poll); plat.poll = null;
+              say('等太久了，可以重新点「添加账号」', true);
+            }
+          }).catch(function () { });
+        }, 3000);
+      }).catch(function (e) { say(String(e.message || e), true); });
+    });
+
+    var allBtn = document.getElementById('platCheckAll');
+    if (allBtn) allBtn.addEventListener('click', function () {
+      say('正在签到…');
+      platAction('checkin', { id: p.id }).then(function (d) {
+        if (!d.ok) { say(d.error || '签到失败', true); return; }
+        say('签到完成：' + (d.checked || 0) + '/' + (d.total || 0));
+        loadPlatforms(true);
+      }).catch(function (e) { say(String(e.message || e), true); });
+    });
+
+    var oneBtns = body.querySelectorAll('[data-checkin]');
+    for (var m = 0; m < oneBtns.length; m++) {
+      oneBtns[m].addEventListener('click', function () {
+        var uid = this.getAttribute('data-checkin');
+        this.disabled = true;
+        say('签到中…');
+        platAction('checkin', { id: p.id, uid: uid }).then(function (d) {
+          say(d.ok ? ('签到完成：' + (d.checked || 0) + '/' + (d.total || 0)) : (d.error || '失败'), !d.ok);
+          loadPlatforms(true);
+        }).catch(function (e) { say(String(e.message || e), true); });
+      });
+    }
+  }
+
+
   function render(d) {
     var p = d.pool, u = d.users;
     var html = '';
@@ -172,6 +333,9 @@
           + urows + '</table>'));
     }
 
+    html += card('平台管理', '同一个界面管三家：看账号、签到、加号',
+      '<div id="poolPlatformTabs" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px"></div>'
+      + '<div id="poolPlatformBody" style="font-size:12.5px;color:var(--dim)">正在读取…</div>');
     // 今日各用户用量
     var rows = '';
     var totalUsed = p.used || 0;
@@ -239,6 +403,7 @@
 
     var body = document.getElementById('poolBody');
     if (body) body.innerHTML = html;
+    if (document.getElementById('poolPlatformTabs')) loadPlatforms(false);
     var up = document.getElementById('poolUpdated');
     if (up) up.textContent = '更新于 ' + (d.now || '刚刚');
   }
