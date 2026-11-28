@@ -95,8 +95,93 @@
     return '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch">' + inner + '</div>';
   }
 
+
+  // ── 侧栏顶部的平台下拉：三个平台放一起选（自绘，避开面板的原生 select 接管） ──
+  var PLAT_STORE = 'wb-pool-platform';
+
+  function platSaved() {
+    try { return localStorage.getItem(PLAT_STORE) || 'all'; } catch (e) { return 'all'; }
+  }
+
+  function applyPlatform(v) {
+    try { localStorage.setItem(PLAT_STORE, v); } catch (e) { }
+    plat.tab = (v === 'all') ? '' : v;
+    var menu = document.getElementById('poolPlatMenu');
+    if (menu) menu.style.display = 'none';
+    goPool();
+    loadPlatforms(true);
+  }
+
+  function mountPlatformSelect() {
+    var brand = document.querySelector('#nextSidebar .next-brand');
+    if (!brand || document.getElementById('poolPlatWrap')) return false;
+    var wrap = document.createElement('div');
+    wrap.id = 'poolPlatWrap';
+    wrap.style.cssText = 'padding:0 8px 14px;position:relative';
+    wrap.innerHTML = ''
+      + '<button type="button" id="poolPlatBtn" style="width:100%;display:flex;align-items:center;justify-content:space-between;gap:6px;'
+      + 'padding:6px 10px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--fg);'
+      + 'font:inherit;font-size:12.5px;cursor:pointer">'
+      + '<span id="poolPlatLabel">全部平台</span><span style="opacity:.5">▾</span></button>'
+      + '<div id="poolPlatMenu" style="display:none;position:absolute;left:8px;right:8px;top:100%;margin-top:4px;z-index:50;'
+      + 'background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.12);overflow:hidden"></div>';
+    brand.parentNode.insertBefore(wrap, brand.nextSibling);
+
+    var btn = wrap.querySelector('#poolPlatBtn');
+    btn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var menu = document.getElementById('poolPlatMenu');
+      menu.style.display = (menu.style.display === 'none' || !menu.style.display) ? 'block' : 'none';
+    });
+    document.addEventListener('click', function () {
+      var menu = document.getElementById('poolPlatMenu');
+      if (menu) menu.style.display = 'none';
+    });
+    return true;
+  }
+
+  function fillPlatformSelect(items) {
+    var menu = document.getElementById('poolPlatMenu');
+    var label = document.getElementById('poolPlatLabel');
+    if (!menu || !items) return;
+    var cur = (plat.tab === null) ? platSaved() : (plat.tab || 'all');
+    if (plat.tab === null) {
+      var known = false;
+      for (var k0 = 0; k0 < items.length; k0++) if (items[k0].id === cur) known = true;
+      plat.tab = known ? cur : '';
+      cur = plat.tab || 'all';
+    }
+    var html = '';
+    var list = [{ id: 'all', name: '全部平台' }].concat(items);
+    for (var i = 0; i < list.length; i++) {
+      var it = list[i];
+      var on = (it.id === 'all' ? (plat.tab === '') : (plat.tab === it.id));
+      var suffix = '';
+      if (it.id !== 'all') {
+        if (it.state === 'ok') suffix = ' · ' + it.accounts.length + ' 个号';
+        else if (it.state === 'off') suffix = ' · 未接入';
+        else suffix = ' · 读取失败';
+      }
+      html += '<div data-plat="' + esc(it.id) + '" style="padding:7px 10px;font-size:12.5px;cursor:pointer;'
+        + (on ? 'background:var(--accent-soft);color:var(--accent);font-weight:600' : 'color:var(--fg)') + '">'
+        + esc(it.name) + esc(suffix) + '</div>';
+    }
+    menu.innerHTML = html;
+    var picked = null;
+    for (var m = 0; m < list.length; m++) {
+      if (list[m].id === (plat.tab === '' ? 'all' : plat.tab)) picked = list[m];
+    }
+    if (label) label.textContent = (picked ? picked.name : '全部平台');
+    var rows = menu.querySelectorAll('[data-plat]');
+    for (var r = 0; r < rows.length; r++) {
+      rows[r].addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        applyPlatform(this.getAttribute('data-plat'));
+      });
+    }
+  }
   // ── 平台管理：三家共用一套界面 ─────────────────────────────
-  var plat = { data: null, at: 0, tab: '', poll: null };
+  var plat = { data: null, at: 0, tab: null, poll: null };  // null=没选过，''=用户选了全部
 
   function platAction(action, body) {
     return fetch('/join/admin/api/platform/' + action, {
@@ -120,7 +205,9 @@
       .then(function (d) {
         plat.data = d.platforms || [];
         plat.at = Date.now();
-        if (!plat.tab && plat.data.length) plat.tab = plat.data[0].id;
+        mountPlatformSelect();
+        fillPlatformSelect(plat.data);
+        if (plat.tab === null && plat.data.length) plat.tab = plat.data[0].id;
         renderPlatformTabs();
       })
       .catch(function (e) {
@@ -160,7 +247,22 @@
     if (!body) return;
     var p = null;
     for (var i = 0; i < (plat.data || []).length; i++) if (plat.data[i].id === plat.tab) p = plat.data[i];
-    if (!p) { body.innerHTML = '<span style="color:var(--dim)">没有可选的平台</span>'; return; }
+    if (!p) {
+      // 选「全部平台」时给一张汇总表，别留空白
+      var srows = '';
+      for (var si = 0; si < (plat.data || []).length; si++) {
+        var sp = plat.data[si];
+        srows += '<tr><td>' + esc(sp.name) + '</td>'
+          + '<td>' + (sp.state === 'ok' ? '<span class="badge ok mini">在线</span>'
+            : (sp.state === 'off' ? '<span class="badge off mini">未接入</span>' : '<span class="badge warn mini">读取失败</span>')) + '</td>'
+          + '<td>' + (sp.state === 'ok' ? sp.accounts.length : '—') + '</td>'
+          + '<td style="font-variant-numeric:tabular-nums">' + (sp.state === 'ok' ? nfmt(sp.usage.used) : '—') + '</td>'
+          + '<td>' + (sp.state === 'ok' ? sp.usage.requests : '—') + '</td></tr>';
+      }
+      body.innerHTML = '<div style="font-size:12px;color:var(--dim);margin-bottom:8px">上面下拉选一个平台，这里就切到那家的账号明细；现在显示的是三家汇总。</div>'
+        + table('<table><tr><th>平台</th><th>状态</th><th>账号</th><th>今日消耗</th><th>今日请求</th></tr>' + srows + '</table>');
+      return;
+    }
     if (p.state === 'off') {
       body.innerHTML = '<div style="color:var(--dim)">' + esc(p.name)
         + ' 还没接入。在 <code>/opt/join-panel/upstreams.json</code> 里把它的 enabled 改成 true。</div>';
@@ -646,6 +748,7 @@
     ensureStyle();
     buildPage();
     addNav();
+    mountPlatformSelect();
     addBottomNav();
     wrapRouter();
     if (timer) clearInterval(timer);
