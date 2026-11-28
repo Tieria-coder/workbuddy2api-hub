@@ -484,6 +484,7 @@ def platform_detail(e):
                 "need_relogin": bool(a.get("needRelogin") or a.get("tokenExpired")),
                 "cooldown": bool(a.get("inCooldown")),
                 "enabled": bool(a.get("enabled", True)),
+                "addedAt": a.get("addedAt") or 0,
             })
         out["accounts"] = rows
         try:
@@ -547,8 +548,13 @@ def platform_login_poll(e, state):
         r = _up_get(e, "/accounts/login/poll", {"state": state})
     except Exception:
         r = _up_post(e, "/accounts/login/poll", {"state": state})
-    return {"ok": True, "status": str(r.get("status") or "unknown"),
-            "message": str(r.get("message") or "")[:160]}
+    out = {"ok": True, "status": str(r.get("status") or "unknown"),
+           "message": str(r.get("message") or "")[:160]}
+    # 网关换取成功时会带回刚入库的那个账号，直接用它做归属，别靠猜
+    acc = r.get("account")
+    if isinstance(acc, dict) and acc.get("uid"):
+        out["account_uid"] = str(acc["uid"])
+    return out
 
 
 def upstreams_overview(ttl=15):
@@ -885,10 +891,12 @@ window.addEventListener('error', function(e){
 """
 
 
-def attribute_account(state, platform='workbuddy'):
-    """poll 成功后，把「最近新加、还没登记」的那个账号记到发起者名下。
+def attribute_account(state, platform='workbuddy', account_uid=None):
+    """poll 成功后，把账号记到发起者名下。
 
-    并发添加时可能认错人，所以只用来做「谁提供的第一号」这种展示，不参与权限判断。
+    首选网关返回的 account.uid（准确）；拿不到时才退回「最近新加、还没登记」
+    的启发式，并且**必须有 addedAt 才敢猜** —— 早先 platform_detail 没带这个
+    字段，max() 在全是 None 时退化成「列表第一个」，把老号记成了新贡献者。
     """
     try:
         with db() as conn:
@@ -897,16 +905,22 @@ def attribute_account(state, platform='workbuddy'):
                 "SELECT account_uid FROM contrib WHERE platform=?", (platform,))}
         if not row:
             return
-        e = up_by_id(platform)
-        pool = (platform_detail(e)["accounts"] if (e and e["enabled"]) else account_list())
-        cands = [a for a in pool if a.get("uid") not in known]
-        if not cands:
+        target = None
+        if account_uid and account_uid not in known:
+            target = account_uid
+        else:
+            e = up_by_id(platform)
+            pool = (platform_detail(e)["accounts"] if (e and e["enabled"]) else account_list())
+            cands = [a for a in pool if a.get("uid") not in known and (a.get("addedAt") or 0) > 0]
+            if cands:
+                target = max(cands, key=lambda a: a.get("addedAt") or 0)["uid"]
+        if not target:
+            log("attribute skipped: no confident account for state=%s platform=%s" % (state[:8], platform))
             return
-        best = max(cands, key=lambda a: a.get("addedAt") or 0)
         with db() as conn:
             conn.execute("INSERT OR REPLACE INTO contrib(account_uid,uid,at,platform) VALUES(?,?,?,?)",
-                         (best["uid"], row["uid"], time.time(), platform))
-        log("attributed %s (%s) -> uid %s" % (best.get("uid", "")[:8], platform, row["uid"]))
+                         (target, row["uid"], time.time(), platform))
+        log("attributed %s (%s) -> uid %s" % (target[:8], platform, row["uid"]))
     except Exception as exc:
         log("attribute failed: %s" % exc)
 
@@ -1726,7 +1740,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"status": "error", "message": str(exc)[:120]}, 502)
             if str(res.get("status")) == "ok":
                 log(f"joined uid={user['id']} platform={pid}")
-                attribute_account(state, pid)
+                attribute_account(state, pid, res.get("account_uid"))
             return self._json({"status": res.get("status"), "message": res.get("message", ""),
                                "platform": pid})
 
