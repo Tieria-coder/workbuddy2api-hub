@@ -516,9 +516,79 @@
     }
   }
 
+  // ── 全部平台：三家看板（每家一块，数字各自独立） ──────────────
+  function plUsed(it) { return (it.usage && typeof it.usage.used === 'number') ? it.usage.used : (typeof it.used === 'number' ? it.used : 0); }
+  function plReq(it) { return (it.usage && typeof it.usage.requests === 'number') ? it.usage.requests : (typeof it.requests === 'number' ? it.requests : 0); }
+  function plAccs(it) { return Array.isArray(it.accounts) ? it.accounts : []; }
+  function plCount(it) { return Array.isArray(it.accounts) ? it.accounts.length : (typeof it.accounts === 'number' ? it.accounts : 0); }
+  function plRemain(it) {
+    if (typeof it.remain === 'number') return it.remain;
+    var accs = plAccs(it), s = 0;
+    for (var k = 0; k < accs.length; k++) if (typeof accs[k].remain === 'number') s += accs[k].remain;
+    return s;
+  }
+
+  function renderThreeBoard(items, fallback) {
+    var list = (items && items.length) ? items : (fallback || []);
+    var tot = { accounts: 0, used: 0, requests: 0, remain: 0 };
+    for (var i = 0; i < list.length; i++) {
+      var it = list[i];
+      tot.accounts += plCount(it);
+      tot.used += plUsed(it);
+      tot.requests += plReq(it);
+      tot.remain += plRemain(it);
+    }
+    var html = '';
+    html += '<div class="card" style="padding:18px 20px;margin-bottom:14px">'
+      + '<div style="font-size:12px;color:var(--dim)">三家合计 · 今天用了多少</div>'
+      + '<div style="display:flex;align-items:baseline;gap:8px;margin-top:6px;flex-wrap:wrap">'
+      + '<span style="font-size:34px;font-weight:750;letter-spacing:-1.2px;color:var(--accent);font-variant-numeric:tabular-nums">' + nfmt(tot.used) + '</span>'
+      + '<span style="font-size:12px;color:var(--dim)">积分 · ' + tot.requests + ' 次请求</span></div>'
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">'
+      + stat('账号合计', tot.accounts + ' 个', '三家加在一起')
+      + stat('剩余积分合计', nfmt(tot.remain, 1), '三家账号余额之和', 'var(--accent2)')
+      + stat('已接入', (function () { var n = 0; for (var k = 0; k < list.length; k++) if (list[k].state === 'ok') n++; return n + ' / ' + list.length; })(), '')
+      + '</div></div>';
+
+    for (var j = 0; j < list.length; j++) {
+      var p = list[j];
+      var ok = p.state === 'ok';
+      var badge = ok ? '<span class="badge ok mini">在线</span>'
+        : (p.state === 'off' ? '<span class="badge off mini">未接入</span>' : '<span class="badge warn mini">读取失败</span>');
+      var accs = plAccs(p);
+      var remainSum = 0, checkedSum = 0;
+      for (var a = 0; a < accs.length; a++) {
+        if (typeof accs[a].remain === 'number') remainSum += accs[a].remain;
+        if (accs[a].checked) checkedSum++;
+      }
+      var rows = '';
+      for (var r = 0; r < accs.length && r < 8; r++) {
+        var x = accs[r];
+        rows += '<tr><td>' + esc(x.nickname) + '</td>'
+          + '<td style="font-variant-numeric:tabular-nums">' + (typeof x.remain === 'number' ? nfmt(x.remain, 1) : '—') + '</td>'
+          + '<td>' + (x.checked ? '已签 ' + x.streak + ' 天' : '<span style="color:var(--warn)">未签到</span>') + '</td></tr>';
+      }
+      if (!rows) rows = '<tr><td colspan="3" style="color:var(--dim)">还没有账号</td></tr>';
+      html += '<div class="card" style="padding:16px 20px;margin-bottom:14px">'
+        + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">'
+        + '<span style="font-size:13px;font-weight:700">' + esc(p.name) + '</span>' + badge
+        + (p.note ? '<span style="font-size:11px;color:var(--dim-light)">' + esc(p.note) + '</span>' : '')
+        + '</div>'
+        + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:10px">'
+        + stat('今日消耗', ok ? nfmt(plUsed(p)) : '—', ok ? (plReq(p) + ' 次请求') : '')
+        + stat('剩余积分', ok ? nfmt(remainSum, 1) : '—', ok ? ('今日已签 ' + checkedSum + '/' + accs.length) : '')
+        + stat('账号', ok ? accs.length + ' 个' : '—', '')
+        + '</div>'
+        + (ok ? table('<table><tr><th>账号</th><th>剩余</th><th>今日签到</th></tr>' + rows + '</table>') : '')
+        + '</div>';
+    }
+    return html;
+  }
   function render(d) {
     var p = d.pool, u = d.users;
     var html = '';
+    var allMode = (plat.tab === '');
+    if (allMode) html += renderThreeBoard(plat.data, (d.upstreams && d.upstreams.items) || []);
     if (plat.scoped) {
       var bodyEl = document.getElementById('poolBody');
       if (bodyEl) {
@@ -577,8 +647,8 @@
       + kpi('池内账号', p.account_count, '当前可用 ' + p.healthy + ' 个')
       + '</div>';
 
-    // 多平台：几家网关的数字摆在一块看
-    if (d.upstreams && d.upstreams.items && d.upstreams.items.length) {
+    // 多平台：几家网关的数字摆在一块看（全部平台视图已用三家看板替代）
+    if (!allMode && d.upstreams && d.upstreams.items && d.upstreams.items.length) {
       var urows = '';
       for (var ui = 0; ui < d.upstreams.items.length; ui++) {
         var it = d.upstreams.items[ui];
