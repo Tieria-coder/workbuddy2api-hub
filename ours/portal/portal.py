@@ -204,6 +204,22 @@ pre{background:#f3ede0;border:1px solid var(--line);border-radius:8px;padding:12
   word-break:break-all;line-height:1.5}
 .faq{font-size:13.5px;margin:0;padding-left:18px}
 .faq li{margin:8px 0}
+@media (max-width:520px){
+  .wrap{padding:0 12px 40px;margin:12px auto}
+  .card{padding:14px;border-radius:9px}
+  .nav{padding:10px 12px;overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch}
+  .nav b{margin-right:8px}
+  .nav .who{display:none}
+  .big{font-size:34px}
+  .grid{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+  .stat{padding:10px 12px}
+  table{font-size:12px}
+  th,td{padding:8px 5px}
+  .kv{grid-template-columns:78px 1fr}
+  button{padding:9px 14px}
+  .btnrow button{flex:1 1 auto}
+  input,textarea{font-size:16px}
+}
 """
 
 
@@ -382,6 +398,8 @@ def load_upstreams():
             "auth_prefix": str(e.get("auth_prefix") or ""),
             "login_path": str(e.get("login_path") or "/panel/login"),
             "login_field": str(e.get("login_field") or "password"),
+            # 只有实现了 /accounts/login/callback 的网关才显示「粘贴回调」框
+            "callback": bool(e.get("callback", False)),
         })
     return out or DEFAULT_UPSTREAMS
 
@@ -447,6 +465,7 @@ def up_by_id(uid):
 def platform_detail(e):
     """一家平台的账号明细（管理视角，显示昵称；朋友那页仍然是匿名的）。"""
     out = {"id": e["id"], "name": e["name"], "note": e["note"],
+           "callback": e.get("callback", False),
            "state": "ok", "accounts": [], "usage": {"used": 0.0, "requests": 0}}
     try:
         data = _up_get(e, "/accounts")
@@ -1149,19 +1168,20 @@ def accounts_body(user):
             n, state = 0, "error"
         pill = ('<span class="pill ok">在线</span>' if state == "ok"
                 else ('<span class="pill warn">读取失败</span>' if state == "error" else '<span class="pill">未接入</span>'))
+        cbflag = "true" if e["callback"] else "false"
         rows += (
             '<div class="card">'
             '<h2 style="display:flex;align-items:center;gap:8px">%s %s</h2>'
             '<div class="sub" style="margin:0 0 10px">%s</div>'
             '<div class="btnrow">'
-            '<button id="go-%s" onclick="startAdd(\'%s\')">添加 %s 账号</button>'
+            '<button id="go-%s" onclick="startAdd(\'%s\',%s)">添加 %s 账号</button>'
             '<span class="hint" id="h-%s" style="margin:0"></span>'
             '</div>'
             '<div id="stage-%s"></div>'
             '<div class="hint">这家现在有 <b>%d</b> 个账号在你的池子里。</div>'
             '</div>'
             % (e["name"], pill, e["note"] or "用官方授权把账号并进池子，密码不经过这里",
-               e["id"], e["id"], e["name"], e["id"], e["id"], n)
+               e["id"], e["id"], cbflag, e["name"], e["id"], e["id"], n)
         )
 
     return """
@@ -1199,7 +1219,7 @@ async function submitCb(pid, state){
   if (!r.ok) { h.textContent = r.error || '提交失败'; h.className = 'hint bad'; return; }
   h.textContent = '已提交，等网关换取令牌…'; h.className = 'hint';
 }
-async function startAdd(pid){
+async function startAdd(pid, canPaste){
   var h = document.getElementById('h-' + pid);
   var stage = document.getElementById('stage-' + pid);
   var btn = document.getElementById('go-' + pid);
@@ -1212,15 +1232,28 @@ async function startAdd(pid){
     if (btn) btn.disabled = false;
     return;
   }
-  stage.innerHTML = '<div class="btnrow"><a class="link" target="_blank" rel="noopener" href="' + r.authUrl
-    + '">打开 ' + (r.name || pid) + ' 官方页面登录并授权 →</a></div>'
-    + '<div class="hint" style="margin-top:10px">手机或别的电脑上打开的：登录完会跳到 127.0.0.1 报「拒绝连接」，'
-    + '把那时地址栏里整条网址复制下来贴到下面就行。</div>'
-    + '<div style="display:flex;gap:8px;margin-top:6px;align-items:flex-start">'
-    + '<textarea id="cb-' + pid + '" rows="2" placeholder="粘贴 http://127.0.0.1:xxxxx/authorize?... 整条网址" '
-    + 'style="flex:1;font-size:12px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#fdfcf8"></textarea>'
-    + '<button class="ghost" onclick="submitCb(\'' + pid + '\',\'' + r.state + '\')">提交回调</button></div>';
-  h.textContent = '登录并同意后回来，这里会自动变成「已加入」。'; h.className = 'hint';
+  var html = '<div class="btnrow"><a class="link" target="_blank" rel="noopener" href="' + r.authUrl
+    + '">打开 ' + (r.name || pid) + ' 官方页面登录并授权 →</a></div>';
+  if (canPaste) {
+    html += '<div class="hint" style="margin-top:10px">在手机或别的电脑上打开的：登录完会跳到 127.0.0.1 报「拒绝连接」，'
+      + '把那时地址栏里整条网址复制下来贴到下面就行。</div>'
+      + '<div style="display:flex;gap:8px;margin-top:6px;align-items:flex-start">'
+      + '<textarea id="cb-' + pid + '" rows="2" placeholder="粘贴 http://127.0.0.1:xxxxx/authorize?... 整条网址" '
+      + 'style="flex:1;font-size:12px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#fdfcf8"></textarea>'
+      + '<button class="ghost" data-cb="' + pid + '" data-state="' + r.state + '">提交回调</button></div>';
+  } else {
+    html += '<div class="hint" style="margin-top:10px">手机、电脑都能开：登录并同意后直接回到本页，'
+      + '这里会自动变成「已加入」，不用复制任何网址。'
+      + '要是官方页面最后跳到 127.0.0.1 报「拒绝连接」，授权其实已经记下了，直接回这一页等着就行。</div>';
+  }
+  stage.innerHTML = html;
+  h.textContent = '等你完成授权…（页面别关）'; h.className = 'hint';
+  if (canPaste) {
+    var cbBtn = stage.querySelector('button[data-cb]');
+    if (cbBtn) cbBtn.addEventListener('click', function () {
+      submitCb(cbBtn.getAttribute('data-cb'), cbBtn.getAttribute('data-state'));
+    });
+  }
   if (btn) { btn.disabled = false; btn.textContent = '重新发起'; }
   var state = r.state, n = 0;
   timers[pid] = setInterval(async function(){
@@ -1572,6 +1605,9 @@ class Handler(BaseHTTPRequestHandler):
                 if action == "login-poll":
                     return self._json(platform_login_poll(e, str(body.get("state") or "")))
                 if action == "login-callback":
+                    if not e.get("callback"):
+                        return self._json({"ok": False,
+                                           "error": "%s 不需要粘贴回调：打开授权链接登录同意即可" % e["name"]}, 400)
                     res = platform_login_callback(e, str(body.get("state") or ""),
                                                   str(body.get("callback_url") or "").strip())
                     return self._json({"ok": True, "upstream": res})
@@ -1705,6 +1741,9 @@ class Handler(BaseHTTPRequestHandler):
             e = up_by_id(pid)
             if not e:
                 return self._json({"ok": False, "error": "这家平台已下线"}, 400)
+            if not e.get("callback"):
+                return self._json({"ok": False,
+                                   "error": "%s 不需要粘贴回调：打开授权链接、在手机上登录同意就行，页面会自己刷新" % e["name"]}, 400)
             try:
                 platform_login_callback(e, state, cb)
             except Exception as exc:

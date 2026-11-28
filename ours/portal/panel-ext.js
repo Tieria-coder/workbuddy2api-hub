@@ -363,6 +363,21 @@
         box.innerHTML = '<div style="margin:6px 0 10px"><a class="link" target="_blank" rel="noopener" href="'
           + esc(d.authUrl) + '">打开 ' + esc(p.name) + ' 官方授权页 →</a>'
           + '<div style="font-size:11.5px;color:var(--dim);margin-top:4px">在上面登录并同意后，这里会自动变成「已加入」；本页别关。</div></div>';
+        if (p.callback) {
+          box.innerHTML += '<div style="font-size:11.5px;color:var(--dim)">手机或别的机器打开时，登录完会跳 127.0.0.1 报拒绝连接——把地址栏整条网址粘到下面：</div>'
+            + '<div style="display:flex;gap:8px;margin:6px 0 10px"><textarea id="platCbUrl" rows="2" placeholder="http://127.0.0.1:xxxxx/authorize?..." style="flex:1;font-size:12px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#fdfcf8"></textarea><button type="button" class="sec mini" id="platCbBtn">提交回调</button></div>';
+          var pcb = document.getElementById('platCbBtn');
+          if (pcb) pcb.addEventListener('click', function () {
+            var ta = document.getElementById('platCbUrl');
+            var url = (ta && ta.value || '').trim();
+            if (!url) { say('先把地址栏那条网址粘进来', true); return; }
+            say('正在提交回调…');
+            platAction('login-callback', { id: p.id, state: d.state, callback_url: url }).then(function (r) {
+              if (!r.ok) { say(r.error || '提交失败', true); return; }
+              say('已提交，等网关换取令牌…');
+            }).catch(function (e) { say(String(e.message || e), true); });
+          });
+        }
         say('等你完成授权…');
         var n = 0;
         if (plat.poll) clearInterval(plat.poll);
@@ -479,10 +494,15 @@
       say('正在申请授权链接…');
       platAction('login-start', { id: p.id }).then(function (d) {
         if (!d.ok) { say(d.error || '申请失败', true); return; }
-        document.getElementById('scopedAuth').innerHTML =
-          '<div style="margin:6px 0 6px"><a class="link" target="_blank" rel="noopener" href="' + esc(d.authUrl) + '">打开 ' + esc(p.name) + ' 官方授权页 →</a></div>'
-          + '<div style="font-size:11.5px;color:var(--dim)">手机或别的机器打开时，登录完会跳 127.0.0.1 报拒绝连接——把地址栏整条网址粘到下面：</div>'
-          + '<div style="display:flex;gap:8px;margin:6px 0 10px"><textarea id="scopedCbUrl" rows="2" placeholder="http://127.0.0.1:xxxxx/authorize?..." style="flex:1;font-size:12px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#fdfcf8"></textarea><button type="button" class="sec mini" id="scopedCbBtn">提交回调</button></div>';
+        var head = '<div style="margin:6px 0 6px"><a class="link" target="_blank" rel="noopener" href="' + esc(d.authUrl) + '">打开 ' + esc(p.name) + ' 官方授权页 →</a></div>';
+        if (p.callback) {
+          document.getElementById('scopedAuth').innerHTML = head
+            + '<div style="font-size:11.5px;color:var(--dim)">手机或别的机器打开时，登录完会跳 127.0.0.1 报拒绝连接——把地址栏整条网址粘到下面：</div>'
+            + '<div style="display:flex;gap:8px;margin:6px 0 10px"><textarea id="scopedCbUrl" rows="2" placeholder="http://127.0.0.1:xxxxx/authorize?..." style="flex:1;font-size:12px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#fdfcf8"></textarea><button type="button" class="sec mini" id="scopedCbBtn">提交回调</button></div>';
+        } else {
+          document.getElementById('scopedAuth').innerHTML = head
+            + '<div style="font-size:11.5px;color:var(--dim)">手机、电脑都能开：登录同意后这里会自动变成「已加入」，不用粘贴任何网址。</div>';
+        }
         var cbBtn = document.getElementById('scopedCbBtn');
         if (cbBtn) cbBtn.addEventListener('click', function () {
           var ta = document.getElementById('scopedCbUrl');
