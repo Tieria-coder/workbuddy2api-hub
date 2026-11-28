@@ -106,9 +106,12 @@
   function applyPlatform(v) {
     try { localStorage.setItem(PLAT_STORE, v); } catch (e) { }
     plat.tab = (v === 'all') ? '' : v;
+    // 选具体某一家（且不是 WorkBuddy，WorkBuddy 就是原面板的池子）时，整页只显示那家的数据
+    plat.scoped = (v !== 'all' && v !== 'workbuddy');
     closePlatMenu();
     goPool();
     loadPlatforms(true);
+    load(true);
   }
 
   function closePlatMenu() {
@@ -132,6 +135,11 @@
   }
 
   function mountPlatformSelect() {
+    var sv = platSaved();
+    if (plat.tab === null && sv && sv !== 'all') {
+      plat.tab = sv;
+      plat.scoped = (sv !== 'workbuddy');
+    }
     var brand = document.querySelector('#nextSidebar .next-brand');
     if (!brand || document.getElementById('poolPlatBtn')) return false;
     var wrap = document.createElement('div');
@@ -214,7 +222,7 @@
     }
   }
   // ── 平台管理：三家共用一套界面 ─────────────────────────────
-  var plat = { data: null, at: 0, tab: null, poll: null };  // null=没选过，''=用户选了全部
+  var plat = { data: null, at: 0, tab: null, poll: null, scoped: false };  // null=没选过，''=全部；scoped=整页只看某一家
 
   function platAction(action, body) {
     return fetch('/join/admin/api/platform/' + action, {
@@ -242,6 +250,11 @@
         fillPlatformSelect(plat.data);
         if (plat.tab === null && plat.data.length) plat.tab = plat.data[0].id;
         renderPlatformTabs();
+        if (plat.scoped) {
+          var pg = document.getElementById('pagePool');
+          var pb = document.getElementById('poolBody');
+          if (pg && pb && pg.classList.contains('active')) pb.innerHTML = renderScopedBody(scopedPlatform());
+        }
       })
       .catch(function (e) {
         var b = document.getElementById('poolPlatformBody');
@@ -270,6 +283,11 @@
       btns[j].addEventListener('click', function () {
         plat.tab = this.getAttribute('data-plat');
         renderPlatformTabs();
+        if (plat.scoped) {
+          var pg = document.getElementById('pagePool');
+          var pb = document.getElementById('poolBody');
+          if (pg && pb && pg.classList.contains('active')) pb.innerHTML = renderScopedBody(scopedPlatform());
+        }
       });
     }
     renderPlatformBody();
@@ -391,9 +409,125 @@
   }
 
 
+  function scopedPlatform() {
+    for (var i = 0; i < (plat.data || []).length; i++) {
+      if (plat.data[i].id === plat.tab) return plat.data[i];
+    }
+    return null;
+  }
+
+  function renderScopedBody(p) {
+    if (!p) {
+      return card('读取中…', '', '<div style="font-size:12.5px;color:var(--dim)">正在从 ' + esc(plat.tab || '') + ' 网关取数…</div>');
+    }
+    if (p.state === 'off') {
+      return card(p.name + ' 未接入', '', '<div style="font-size:12.5px;color:var(--dim)">在 <code>/opt/join-panel/upstreams.json</code> 里把它的 enabled 改成 true。</div>');
+    }
+    if (p.state === 'error') {
+      return card(p.name + ' 读取失败', '', '<div style="font-size:12.5px;color:var(--bad)">' + esc(p.error || '') + '</div>');
+    }
+    var rows = '';
+    var remainSum = 0, healthy = 0, checked = 0;
+    for (var k = 0; k < p.accounts.length; k++) {
+      var a = p.accounts[k];
+      if (typeof a.remain === 'number') remainSum += a.remain;
+      if (a.enabled && !a.need_relogin && !a.cooldown) healthy++;
+      if (a.checked) checked++;
+      var badge = a.need_relogin ? '<span class="badge warn mini">需重新授权</span>'
+        : (!a.enabled ? '<span class="badge off mini">已停用</span>'
+          : (a.cooldown ? '<span class="badge warn mini">冷却中</span>' : '<span class="badge ok mini">正常</span>'));
+      rows += '<tr><td>' + esc(a.nickname) + '</td>'
+        + '<td style="font-variant-numeric:tabular-nums">' + (typeof a.remain === 'number' ? nfmt(a.remain, 1) : '—') + '</td>'
+        + '<td>' + (a.checked ? '已签 ' + a.streak + ' 天' : '<span style="color:var(--warn)">未签到</span>') + '</td>'
+        + '<td>' + badge + '</td>'
+        + '<td><button type="button" class="sec mini" data-scoped-checkin="' + esc(a.uid) + '">签到</button></td></tr>';
+    }
+    if (!rows) rows = '<tr><td colspan="5" style="color:var(--dim)">这家还没有账号，点「添加账号」授权一个</td></tr>';
+
+    var html = '';
+    html += '<div class="card" style="padding:18px 20px;margin-bottom:14px">'
+      + '<div style="font-size:12px;color:var(--dim)">' + esc(p.name) + ' · 今日消耗</div>'
+      + '<div style="display:flex;align-items:baseline;gap:8px;margin-top:6px;flex-wrap:wrap">'
+      + '<span style="font-size:34px;font-weight:750;letter-spacing:-1.2px;color:var(--accent);font-variant-numeric:tabular-nums">' + nfmt(p.usage.used) + '</span>'
+      + '<span style="font-size:12px;color:var(--dim)">积分 · ' + p.usage.requests + ' 次请求</span></div>'
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">'
+      + stat('账号', p.accounts.length + ' 个', '可用 ' + healthy + ' 个')
+      + stat('剩余积分', nfmt(remainSum, 1), '这家所有账号之和')
+      + stat('今日已签到', checked + ' / ' + p.accounts.length, '')
+      + '</div></div>';
+    html += card(p.name + ' 的账号', '只看这一家；点右上角下拉可以换平台或回到全部',
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">'
+      + '<button type="button" class="sec mini" id="scopedAddBtn">添加账号</button>'
+      + '<button type="button" class="sec mini" id="scopedCheckAll">全部签到</button>'
+      + '<span id="scopedMsg" style="font-size:11.5px;color:var(--dim)"></span></div>'
+      + '<div id="scopedAuth"></div>'
+      + table('<table><tr><th>账号</th><th>剩余积分</th><th>今日签到</th><th>状态</th><th></th></tr>' + rows + '</table>'));
+
+    setTimeout(function () { bindScopedActions(p); }, 0);
+    return html;
+  }
+
+  function bindScopedActions(p) {
+    var msg = document.getElementById('scopedMsg');
+    function say(text, bad) {
+      if (!msg) return;
+      msg.textContent = text || '';
+      msg.style.color = bad ? 'var(--bad)' : 'var(--dim)';
+    }
+    var add = document.getElementById('scopedAddBtn');
+    if (add) add.addEventListener('click', function () {
+      say('正在申请授权链接…');
+      platAction('login-start', { id: p.id }).then(function (d) {
+        if (!d.ok) { say(d.error || '申请失败', true); return; }
+        document.getElementById('scopedAuth').innerHTML =
+          '<div style="margin:6px 0 10px"><a class="link" target="_blank" rel="noopener" href="' + esc(d.authUrl) + '">打开 ' + esc(p.name) + ' 官方授权页 →</a></div>';
+        say('等你在官方页面同意…');
+        var n = 0;
+        if (plat.poll) clearInterval(plat.poll);
+        plat.poll = setInterval(function () {
+          n++;
+          platAction('login-poll', { id: p.id, state: d.state }).then(function (r) {
+            if (r.status === 'ok') { clearInterval(plat.poll); plat.poll = null; say('已加入'); loadPlatforms(true); load(true); }
+            else if (r.status === 'expired' || r.status === 'error') { clearInterval(plat.poll); plat.poll = null; say('授权没走完：' + (r.message || r.status), true); }
+            else if (n >= 40) { clearInterval(plat.poll); plat.poll = null; say('等太久了，重新点一次', true); }
+          }).catch(function () { });
+        }, 3000);
+      }).catch(function (e) { say(String(e.message || e), true); });
+    });
+    var all = document.getElementById('scopedCheckAll');
+    if (all) all.addEventListener('click', function () {
+      say('正在签到…');
+      platAction('checkin', { id: p.id }).then(function (d) {
+        say(d.ok ? ('签到完成：' + (d.checked || 0) + '/' + (d.total || 0)) : (d.error || '失败'), !d.ok);
+        loadPlatforms(true);
+      }).catch(function (e) { say(String(e.message || e), true); });
+    });
+    var one = document.querySelectorAll('[data-scoped-checkin]');
+    for (var i = 0; i < one.length; i++) {
+      one[i].addEventListener('click', function () {
+        var uid = this.getAttribute('data-scoped-checkin');
+        this.disabled = true;
+        say('签到中…');
+        platAction('checkin', { id: p.id, uid: uid }).then(function (d) {
+          say(d.ok ? ('签到完成：' + (d.checked || 0) + '/' + (d.total || 0)) : (d.error || '失败'), !d.ok);
+          loadPlatforms(true);
+        }).catch(function (e) { say(String(e.message || e), true); });
+      });
+    }
+  }
+
   function render(d) {
     var p = d.pool, u = d.users;
     var html = '';
+    if (plat.scoped) {
+      var bodyEl = document.getElementById('poolBody');
+      if (bodyEl) {
+        bodyEl.innerHTML = renderScopedBody(scopedPlatform());
+        var up0 = document.getElementById('poolUpdated');
+        if (up0) up0.textContent = '更新于 ' + (d.now || '刚刚');
+      }
+      return;
+    }
 
     html += '<div class="card" style="padding:18px 20px;margin-bottom:14px">'
       + '<div style="font-size:12px;color:var(--dim)">今天这个池子用了多少</div>'
