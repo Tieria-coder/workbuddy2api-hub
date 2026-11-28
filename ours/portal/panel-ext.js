@@ -96,7 +96,7 @@
   }
 
 
-  // ── 侧栏顶部的平台下拉：三个平台放一起选（自绘，避开面板的原生 select 接管） ──
+  // ── 侧栏顶部的平台下拉（自绘 + 挂到 body 固定定位，避免被侧栏裁切） ──
   var PLAT_STORE = 'wb-pool-platform';
 
   function platSaved() {
@@ -106,44 +106,78 @@
   function applyPlatform(v) {
     try { localStorage.setItem(PLAT_STORE, v); } catch (e) { }
     plat.tab = (v === 'all') ? '' : v;
-    var menu = document.getElementById('poolPlatMenu');
-    if (menu) menu.style.display = 'none';
+    closePlatMenu();
     goPool();
     loadPlatforms(true);
   }
 
+  function closePlatMenu() {
+    var m = document.getElementById('poolPlatMenu');
+    if (m) m.style.display = 'none';
+  }
+
+  function openPlatMenu() {
+    var btn = document.getElementById('poolPlatBtn');
+    var m = document.getElementById('poolPlatMenu');
+    if (!btn || !m) return;
+    var r = btn.getBoundingClientRect();
+    m.style.left = Math.round(r.left) + 'px';
+    m.style.top = Math.round(r.bottom + 6) + 'px';
+    m.style.width = Math.round(Math.max(160, r.width)) + 'px';
+    m.style.display = 'block';
+    if (!m.dataset.filled) {
+      m.innerHTML = '<div style="padding:8px 10px;font-size:12px;color:var(--dim)">正在读取平台…</div>';
+      loadPlatforms(true);
+    }
+  }
+
   function mountPlatformSelect() {
     var brand = document.querySelector('#nextSidebar .next-brand');
-    if (!brand || document.getElementById('poolPlatWrap')) return false;
+    if (!brand || document.getElementById('poolPlatBtn')) return false;
     var wrap = document.createElement('div');
     wrap.id = 'poolPlatWrap';
-    wrap.style.cssText = 'padding:0 8px 14px;position:relative';
+    wrap.style.cssText = 'padding:0 8px 14px';
     wrap.innerHTML = ''
       + '<button type="button" id="poolPlatBtn" style="width:100%;display:flex;align-items:center;justify-content:space-between;gap:6px;'
       + 'padding:6px 10px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--fg);'
       + 'font:inherit;font-size:12.5px;cursor:pointer">'
-      + '<span id="poolPlatLabel">全部平台</span><span style="opacity:.5">▾</span></button>'
-      + '<div id="poolPlatMenu" style="display:none;position:absolute;left:8px;right:8px;top:100%;margin-top:4px;z-index:50;'
-      + 'background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.12);overflow:hidden"></div>';
+      + '<span id="poolPlatLabel">全部平台</span><span style="opacity:.5">▾</span></button>';
     brand.parentNode.insertBefore(wrap, brand.nextSibling);
+
+    // 菜单挂到 body，position:fixed，谁也别想裁掉它
+    var menu = document.createElement('div');
+    menu.id = 'poolPlatMenu';
+    menu.style.cssText = 'display:none;position:fixed;z-index:9999;background:var(--panel,#fff);'
+      + 'border:1px solid var(--line,#d5cfbc);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.16);overflow:hidden';
+    document.body.appendChild(menu);
 
     var btn = wrap.querySelector('#poolPlatBtn');
     btn.addEventListener('click', function (ev) {
       ev.stopPropagation();
-      var menu = document.getElementById('poolPlatMenu');
-      menu.style.display = (menu.style.display === 'none' || !menu.style.display) ? 'block' : 'none';
+      var m = document.getElementById('poolPlatMenu');
+      if (m && m.style.display === 'block') closePlatMenu();
+      else openPlatMenu();
     });
-    document.addEventListener('click', function () {
-      var menu = document.getElementById('poolPlatMenu');
-      if (menu) menu.style.display = 'none';
+    document.addEventListener('click', function (ev) {
+      var m = document.getElementById('poolPlatMenu');
+      if (!m || m.style.display !== 'block') return;
+      if (m.contains(ev.target)) return;
+      closePlatMenu();
     });
+    window.addEventListener('resize', closePlatMenu);
+    window.addEventListener('scroll', closePlatMenu, true);
     return true;
   }
 
   function fillPlatformSelect(items) {
     var menu = document.getElementById('poolPlatMenu');
     var label = document.getElementById('poolPlatLabel');
-    if (!menu || !items) return;
+    if (!menu) return;
+    if (!items || !items.length) {
+      menu.innerHTML = '<div style="padding:8px 10px;font-size:12px;color:var(--dim)">还没有可选的平台</div>';
+      menu.dataset.filled = '1';
+      return;
+    }
     var cur = (plat.tab === null) ? platSaved() : (plat.tab || 'all');
     if (plat.tab === null) {
       var known = false;
@@ -151,26 +185,25 @@
       plat.tab = known ? cur : '';
       cur = plat.tab || 'all';
     }
+    var list = [{ id: 'all', name: '全部平台', state: 'ok', accounts: [] }].concat(items);
     var html = '';
-    var list = [{ id: 'all', name: '全部平台' }].concat(items);
     for (var i = 0; i < list.length; i++) {
       var it = list[i];
       var on = (it.id === 'all' ? (plat.tab === '') : (plat.tab === it.id));
       var suffix = '';
       if (it.id !== 'all') {
-        if (it.state === 'ok') suffix = ' · ' + it.accounts.length + ' 个号';
+        if (it.state === 'ok') suffix = ' · ' + (it.accounts ? it.accounts.length : 0) + ' 个号';
         else if (it.state === 'off') suffix = ' · 未接入';
         else suffix = ' · 读取失败';
       }
-      html += '<div data-plat="' + esc(it.id) + '" style="padding:7px 10px;font-size:12.5px;cursor:pointer;'
-        + (on ? 'background:var(--accent-soft);color:var(--accent);font-weight:600' : 'color:var(--fg)') + '">'
+      html += '<div data-plat="' + esc(it.id) + '" style="padding:8px 10px;font-size:12.5px;cursor:pointer;'
+        + (on ? 'background:var(--accent-soft,rgba(161,68,39,.09));color:var(--accent,#a14427);font-weight:600' : 'color:var(--fg,#1f1e1b)') + '">'
         + esc(it.name) + esc(suffix) + '</div>';
     }
     menu.innerHTML = html;
+    menu.dataset.filled = '1';
     var picked = null;
-    for (var m = 0; m < list.length; m++) {
-      if (list[m].id === (plat.tab === '' ? 'all' : plat.tab)) picked = list[m];
-    }
+    for (var m2 = 0; m2 < list.length; m2++) if (list[m2].id === (plat.tab === '' ? 'all' : plat.tab)) picked = list[m2];
     if (label) label.textContent = (picked ? picked.name : '全部平台');
     var rows = menu.querySelectorAll('[data-plat]');
     for (var r = 0; r < rows.length; r++) {
