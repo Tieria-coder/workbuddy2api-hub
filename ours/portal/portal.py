@@ -515,6 +515,14 @@ def platform_login_start(e):
     return {"ok": False, "error": last or "上游没给授权链接"}
 
 
+def platform_login_callback(e, state, callback_url):
+    """把浏览器里那条回调 URL 交给网关完成换取令牌（远程浏览器场景）。"""
+    if not state or not callback_url:
+        raise RuntimeError("缺少 state 或回调地址")
+    return _up_post(e, "/accounts/login/callback",
+                    {"state": state, "callback_url": callback_url})
+
+
 def platform_login_poll(e, state):
     try:
         r = _up_get(e, "/accounts/login/poll", {"state": state})
@@ -1181,6 +1189,16 @@ def accounts_body(user):
 </div>
 <script>
 var timers = {};
+async function submitCb(pid, state){
+  var h = document.getElementById('h-' + pid);
+  var ta = document.getElementById('cb-' + pid);
+  var url = (ta && ta.value || '').trim();
+  if (!url) { h.textContent = '先把地址栏那条网址粘进来'; h.className = 'hint bad'; return; }
+  h.textContent = '正在提交回调…'; h.className = 'hint';
+  var r = await post('/join/api/account/callback', { state: state, callback_url: url });
+  if (!r.ok) { h.textContent = r.error || '提交失败'; h.className = 'hint bad'; return; }
+  h.textContent = '已提交，等网关换取令牌…'; h.className = 'hint';
+}
 async function startAdd(pid){
   var h = document.getElementById('h-' + pid);
   var stage = document.getElementById('stage-' + pid);
@@ -1195,7 +1213,13 @@ async function startAdd(pid){
     return;
   }
   stage.innerHTML = '<div class="btnrow"><a class="link" target="_blank" rel="noopener" href="' + r.authUrl
-    + '">打开 ' + (r.name || pid) + ' 官方页面登录并授权 →</a></div>';
+    + '">打开 ' + (r.name || pid) + ' 官方页面登录并授权 →</a></div>'
+    + '<div class="hint" style="margin-top:10px">手机或别的电脑上打开的：登录完会跳到 127.0.0.1 报「拒绝连接」，'
+    + '把那时地址栏里整条网址复制下来贴到下面就行。</div>'
+    + '<div style="display:flex;gap:8px;margin-top:6px;align-items:flex-start">'
+    + '<textarea id="cb-' + pid + '" rows="2" placeholder="粘贴 http://127.0.0.1:xxxxx/authorize?... 整条网址" '
+    + 'style="flex:1;font-size:12px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#fdfcf8"></textarea>'
+    + '<button class="ghost" onclick="submitCb(\'' + pid + '\',\'' + r.state + '\')">提交回调</button></div>';
   h.textContent = '登录并同意后回来，这里会自动变成「已加入」。'; h.className = 'hint';
   if (btn) { btn.disabled = false; btn.textContent = '重新发起'; }
   var state = r.state, n = 0;
@@ -1547,6 +1571,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(platform_login_start(e))
                 if action == "login-poll":
                     return self._json(platform_login_poll(e, str(body.get("state") or "")))
+                if action == "login-callback":
+                    res = platform_login_callback(e, str(body.get("state") or ""),
+                                                  str(body.get("callback_url") or "").strip())
+                    return self._json({"ok": True, "upstream": res})
             except Exception as exc:
                 log("platform %s %s failed: %s" % (e["id"], action, exc))
                 return self._json({"ok": False, "error": str(exc)[:120]}, 502)
@@ -1665,6 +1693,24 @@ class Handler(BaseHTTPRequestHandler):
                 attribute_account(state, pid)
             return self._json({"status": res.get("status"), "message": res.get("message", ""),
                                "platform": pid})
+
+        if path == "/api/account/callback":
+            state = str(body.get("state") or "").strip()
+            cb = str(body.get("callback_url") or "").strip()
+            if not state or not cb:
+                return self._json({"ok": False, "error": "缺少 state 或回调地址"}, 400)
+            with db() as conn:
+                row = conn.execute("SELECT platform FROM login_states WHERE state=?", (state,)).fetchone()
+            pid = (row["platform"] if row and row["platform"] else "workbuddy")
+            e = up_by_id(pid)
+            if not e:
+                return self._json({"ok": False, "error": "这家平台已下线"}, 400)
+            try:
+                platform_login_callback(e, state, cb)
+            except Exception as exc:
+                log(f"callback failed uid={user['id']} platform={pid} err={exc}")
+                return self._json({"ok": False, "error": str(exc)[:140]}, 502)
+            return self._json({"ok": True, "platform": pid})
 
         if path == "/api/key/create":
             with db() as conn:

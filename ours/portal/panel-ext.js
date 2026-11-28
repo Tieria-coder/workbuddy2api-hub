@@ -480,7 +480,20 @@
       platAction('login-start', { id: p.id }).then(function (d) {
         if (!d.ok) { say(d.error || '申请失败', true); return; }
         document.getElementById('scopedAuth').innerHTML =
-          '<div style="margin:6px 0 10px"><a class="link" target="_blank" rel="noopener" href="' + esc(d.authUrl) + '">打开 ' + esc(p.name) + ' 官方授权页 →</a></div>';
+          '<div style="margin:6px 0 6px"><a class="link" target="_blank" rel="noopener" href="' + esc(d.authUrl) + '">打开 ' + esc(p.name) + ' 官方授权页 →</a></div>'
+          + '<div style="font-size:11.5px;color:var(--dim)">手机或别的机器打开时，登录完会跳 127.0.0.1 报拒绝连接——把地址栏整条网址粘到下面：</div>'
+          + '<div style="display:flex;gap:8px;margin:6px 0 10px"><textarea id="scopedCbUrl" rows="2" placeholder="http://127.0.0.1:xxxxx/authorize?..." style="flex:1;font-size:12px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#fdfcf8"></textarea><button type="button" class="sec mini" id="scopedCbBtn">提交回调</button></div>';
+        var cbBtn = document.getElementById('scopedCbBtn');
+        if (cbBtn) cbBtn.addEventListener('click', function () {
+          var ta = document.getElementById('scopedCbUrl');
+          var url = (ta && ta.value || '').trim();
+          if (!url) { say('先把地址栏那条网址粘进来', true); return; }
+          say('正在提交回调…');
+          platAction('login-callback', { id: p.id, state: d.state, callback_url: url }).then(function (r) {
+            if (!r.ok) { say(r.error || '提交失败', true); return; }
+            say('已提交，等网关换取令牌…');
+          }).catch(function (e) { say(String(e.message || e), true); });
+        });
         say('等你在官方页面同意…');
         var n = 0;
         if (plat.poll) clearInterval(plat.poll);

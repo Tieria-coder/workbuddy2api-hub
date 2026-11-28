@@ -158,3 +158,17 @@ tyly 已经生成了一把（`portal-tyly-3`），页面上可「显示完整 Ke
 
 实测：`/join/accounts` 三张卡都在（WorkBuddy 5 个号 / Qoder 1 个 / Trae 0）；tyly 的 keys 页没有拦截提示、
 直接显示已领取；`/api/account/start` 对 qoder 与 trae 都返回了真实的官方授权链接。
+## 11. 远程浏览器授权：粘贴回调（2026-11-28）
+
+Trae / Qoder 这类 OAuth 授权完成后会跳回 `http://127.0.0.1:<端口>/authorize?...`（官方客户端在本机监听）。
+在**手机**或**别的电脑**上打开授权页时，这个回环地址落在那台设备上，必然 `ERR_CONNECTION_REFUSED`。
+
+两边都加了「粘贴回调地址」：
+
+- `POST /join/api/account/callback {state, callback_url}`（朋友端，会话鉴权）
+- `POST /admin/api/platform/login-callback {id, state, callback_url}`（面板端，面板令牌鉴权）
+- 都转发到上游的 `POST /accounts/login/callback`，由网关完成 PKCE 换取令牌
+
+UI：朋友端「添加 X 账号」出链接后多一个文本框 + 「提交回调」；面板单平台视图同样有一份。
+
+注意：一次授权对应一次回调，会话 10 分钟过期，旧回调不能重复使用。
