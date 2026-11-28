@@ -105,16 +105,23 @@ def init_db():
             token TEXT PRIMARY KEY, uid INTEGER NOT NULL, exp REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS login_states(
-            state TEXT PRIMARY KEY, uid INTEGER NOT NULL, at REAL NOT NULL
+            state TEXT PRIMARY KEY, uid INTEGER NOT NULL, at REAL NOT NULL,
+            platform TEXT NOT NULL DEFAULT 'workbuddy'
         );
         CREATE TABLE IF NOT EXISTS contrib(
-            account_uid TEXT PRIMARY KEY, uid INTEGER NOT NULL, at REAL NOT NULL
+            account_uid TEXT PRIMARY KEY, uid INTEGER NOT NULL, at REAL NOT NULL,
+            platform TEXT NOT NULL DEFAULT 'workbuddy'
         );
         CREATE TABLE IF NOT EXISTS user_keys(
             uid INTEGER PRIMARY KEY, key TEXT NOT NULL, name TEXT NOT NULL,
             created REAL NOT NULL, key_id TEXT
         );
         """)
+        # 老库补列（2026-11-28 支持多家平台加号）
+        for tbl in ("contrib", "login_states"):
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(%s)" % tbl)]
+            if "platform" not in cols:
+                conn.execute("ALTER TABLE %s ADD COLUMN platform TEXT NOT NULL DEFAULT 'workbuddy'" % tbl)
 
 
 def hash_pw(pw, salt=None):
@@ -851,7 +858,7 @@ window.addEventListener('error', function(e){
 """
 
 
-def attribute_account(state):
+def attribute_account(state, platform='workbuddy'):
     """poll 成功后，把「最近新加、还没登记」的那个账号记到发起者名下。
 
     并发添加时可能认错人，所以只用来做「谁提供的第一号」这种展示，不参与权限判断。
@@ -859,17 +866,20 @@ def attribute_account(state):
     try:
         with db() as conn:
             row = conn.execute("SELECT uid FROM login_states WHERE state=?", (state,)).fetchone()
-            known = {r["account_uid"] for r in conn.execute("SELECT account_uid FROM contrib")}
+            known = {r["account_uid"] for r in conn.execute(
+                "SELECT account_uid FROM contrib WHERE platform=?", (platform,))}
         if not row:
             return
-        cands = [a for a in account_list() if a.get("uid") not in known]
+        e = up_by_id(platform)
+        pool = (platform_detail(e)["accounts"] if (e and e["enabled"]) else account_list())
+        cands = [a for a in pool if a.get("uid") not in known]
         if not cands:
             return
         best = max(cands, key=lambda a: a.get("addedAt") or 0)
         with db() as conn:
-            conn.execute("INSERT OR REPLACE INTO contrib(account_uid,uid,at) VALUES(?,?,?)",
-                         (best["uid"], row["uid"], time.time()))
-        log("attributed %s -> uid %s" % (best.get("uid", "")[:8], row["uid"]))
+            conn.execute("INSERT OR REPLACE INTO contrib(account_uid,uid,at,platform) VALUES(?,?,?,?)",
+                         (best["uid"], row["uid"], time.time(), platform))
+        log("attributed %s (%s) -> uid %s" % (best.get("uid", "")[:8], platform, row["uid"]))
     except Exception as exc:
         log("attribute failed: %s" % exc)
 
@@ -1120,85 +1130,92 @@ def dashboard_body(user):
 
 
 def accounts_body(user):
+    plats = [e for e in load_upstreams() if e["enabled"]]
+    rows = ""
+    for e in plats:
+        try:
+            d = platform_detail(e)
+            n = len(d["accounts"]) if d.get("state") == "ok" else 0
+            state = d.get("state")
+        except Exception:
+            n, state = 0, "error"
+        pill = ('<span class="pill ok">在线</span>' if state == "ok"
+                else ('<span class="pill warn">读取失败</span>' if state == "error" else '<span class="pill">未接入</span>'))
+        rows += (
+            '<div class="card">'
+            '<h2 style="display:flex;align-items:center;gap:8px">%s %s</h2>'
+            '<div class="sub" style="margin:0 0 10px">%s</div>'
+            '<div class="btnrow">'
+            '<button id="go-%s" onclick="startAdd(\'%s\')">添加 %s 账号</button>'
+            '<span class="hint" id="h-%s" style="margin:0"></span>'
+            '</div>'
+            '<div id="stage-%s"></div>'
+            '<div class="hint">这家现在有 <b>%d</b> 个账号在你的池子里。</div>'
+            '</div>'
+            % (e["name"], pill, e["note"] or "用官方授权把账号并进池子，密码不经过这里",
+               e["id"], e["id"], e["name"], e["id"], e["id"], n)
+        )
+
     return """
 <div class="card">
   <h1>添加账号</h1>
-  <div class="sub">把你自己的 workbuddy 账号并进这个共享池子。登录和授权都在腾讯的页面上完成，
-  密码不经过这里，我们只拿到一个授权凭证。</div>
-  <ol class="steps">
-    <li><b>点下面的「开始授权」</b>
-      <div class="hint">会给你一个腾讯官方登录链接，用你自己的账号登录并同意授权。</div>
-    </li>
-    <li><b>在官方页面里点同意</b>
-      <div class="hint">授权完成后这个页面不用关，回来就行，状态会自己变。</div>
-    </li>
-    <li><b>等状态变成「已加入」</b>
-      <div class="hint">通常十几秒内就好；超过两分钟没反应，点「重新发起」再试一次。</div>
-    </li>
-  </ol>
-  <div class="btnrow">
-    <button id="go" onclick="start()">开始授权</button>
-    <span id="again" style="display:none"><button class="ghost" onclick="start()">重新发起</button></span>
-  </div>
-  <div class="hint" id="h"></div>
-  <div id="stage"></div>
+  <div class="sub">三家都能加：每家单独授权，密码都在官方页面输入，这里只拿授权凭证。
+  加进来的账号供池子里所有人共用，你也能用别人加的号。</div>
 </div>
+""" + rows + """
 <div class="card">
-  <h2>加进来会发生什么</h2>
-  <div class="sub" style="margin:0">账号并入池子后供所有人共用，你也能用别人加的号。加得越多池子越抗用；
-  只加不用的账号，调度器每天会自动帮它签到领额度。</div>
+  <h2>加号之后</h2>
+  <ul class="faq">
+    <li>授权完成会自动并入池子，页面上那家账号数会 +1，不用你手动刷新页面。</li>
+    <li>加进来只加不用的账号，调度器每天会帮它签到领额度。</li>
+    <li>同一家可以加多个号；不同家互不影响。</li>
+  </ul>
 </div>
 <div class="card">
   <h2>卡住时看这里</h2>
   <ul class="faq">
-    <li><b>点了「开始授权」没反应</b>：等两三秒，按钮下面会出链接；一直不出多半是被限流（同一出口 IP 十分钟内点太多次），等一分钟再来。</li>
-    <li><b>官方页面打不开或登录不上</b>：换浏览器或关掉代理再试；腾讯那边偶尔要求短信验证，按它提示走完即可。</li>
-    <li><b>提示「操作太频繁」</b>：同一出口 IP 十分钟内点太多次，歇一会儿再点。</li>
-    <li><b>加进去以后看不到余额</b>：余额要先让面板刷新一次积分，等一两分钟。</li>
+    <li><b>点了「添加」没反应</b>：等两三秒，按钮下面会出官方链接；一直不出多半是被限流，等一分钟再来。</li>
+    <li><b>官方页面打不开或登录不上</b>：换浏览器或关掉代理再试。</li>
+    <li><b>提示「操作太频繁」</b>：同一出口 IP 十分钟内点太多次，歇一会儿。</li>
   </ul>
 </div>
 <script>
-let state=null,timer=null;
-async function start(){
-  const h=document.getElementById('h');
-  const go=document.getElementById('go');
-  clearInterval(timer);timer=null;
-  if(go)go.disabled=true;
-  h.textContent='正在申请授权链接…';h.className='hint';
-  const r=await post('/join/api/account/start',{});
-  if(!r.ok){
-    h.textContent=r.error||'申请失败';h.className='hint bad';
-    if(go)go.disabled=false;
-    document.getElementById('again').style.display='inline';
+var timers = {};
+async function startAdd(pid){
+  var h = document.getElementById('h-' + pid);
+  var stage = document.getElementById('stage-' + pid);
+  var btn = document.getElementById('go-' + pid);
+  if (timers[pid]) { clearInterval(timers[pid]); timers[pid] = null; }
+  if (btn) btn.disabled = true;
+  h.textContent = '正在申请授权链接…'; h.className = 'hint';
+  var r = await post('/join/api/account/start', { platform: pid });
+  if (!r.ok) {
+    h.textContent = r.error || '申请失败'; h.className = 'hint bad';
+    if (btn) btn.disabled = false;
     return;
   }
-  state=r.state;
-  document.getElementById('stage').innerHTML='<div class="btnrow"><a class="link" target="_blank" rel="noopener" href="'+r.authUrl+'">打开腾讯官方页面登录并授权 →</a></div>';
-  h.textContent='已拿到授权链接。登录并同意后回来，这里会自动变成「已加入」。';h.className='hint';
-  document.getElementById('again').style.display='inline';
-  document.getElementById('go').textContent='重新发起';
-  document.getElementById('go').disabled=false;
-  timer=setInterval(poll,3000);
-}
-async function poll(){
-  if(!state)return;
-  let r;
-  try{ r=await post('/join/api/account/poll',{state}); }catch(e){ return; }
-  const h=document.getElementById('h');
-  if(r.status==='pending'){h.textContent='等你完成授权…（这个页面不用关）';h.className='hint';return;}
-  clearInterval(timer);timer=null;
-  if(r.status==='ok'){
-    h.textContent='已加入池子，谢谢！现在可以去「API Key」页领你自己的 Key 了。';
-    h.className='hint ok';
-    document.getElementById('stage').innerHTML='';
-    setTimeout(function(){location.reload();},1500);
-  }else{
-    h.textContent=(r.message||'授权没走完')+'。可以点「重新发起」再来一次。';
-    h.className='hint warn';
-  }
+  stage.innerHTML = '<div class="btnrow"><a class="link" target="_blank" rel="noopener" href="' + r.authUrl
+    + '">打开 ' + (r.name || pid) + ' 官方页面登录并授权 →</a></div>';
+  h.textContent = '登录并同意后回来，这里会自动变成「已加入」。'; h.className = 'hint';
+  if (btn) { btn.disabled = false; btn.textContent = '重新发起'; }
+  var state = r.state, n = 0;
+  timers[pid] = setInterval(async function(){
+    n++;
+    var q;
+    try { q = await post('/join/api/account/poll', { state: state }); } catch (e) { return; }
+    if (q.status === 'pending') { h.textContent = '等你完成授权…（页面别关）'; return; }
+    clearInterval(timers[pid]); timers[pid] = null;
+    if (q.status === 'ok') {
+      h.textContent = '已加入池子，谢谢！'; h.className = 'hint ok';
+      stage.innerHTML = '';
+      setTimeout(function(){ location.reload(); }, 1200);
+    } else if (n < 40) {
+      h.textContent = (q.message || '授权没走完') + '，可以点「重新发起」再来一次。';
+      h.className = 'hint warn';
+    }
+  }, 3000);
 }
 </script>"""
-
 
 KEY_JS = """
 <script>
@@ -1294,8 +1311,8 @@ def keys_body(user, public_base=""):
             '<div class="hint" id="h">别把 Key 贴到群里或提交到 GitHub；谁拿到它，用掉的额度都记在你名下。</div>'
         )
     else:
-        gate = ('' if contribs else
-                '<div class="hint warn">领 Key 之前先用「添加账号」贡献一个 workbuddy 账号——'
+        gate = ('' if (contribs or is_admin(user)) else
+                '<div class="hint warn">领 Key 之前先用「添加账号」贡献一个账号——'
                 '池子是大家凑出来的，谁加了账号谁才能领。</div>')
         own = (
             '<div class="sub">生成一把只属于你的 Key，用它调这个池子。额度是大家共用的，'
@@ -1609,31 +1626,45 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/account/start":
             if not rate_ok(ip):
                 return self._json({"ok": False, "error": "操作太频繁，稍后再试"}, 429)
+            pid = str(body.get("platform") or "workbuddy").strip()
+            e = up_by_id(pid)
+            if not e:
+                return self._json({"ok": False, "error": "没有这家平台"}, 404)
+            if not e["enabled"]:
+                return self._json({"ok": False, "error": "%s 还没接入" % e["name"]}, 400)
             try:
-                res = api("POST", "/accounts/login/start", {"platform": "CLI", "realm": "cn"})
+                res = platform_login_start(e)
             except Exception as exc:
-                log(f"start failed uid={user['id']} err={exc}")
-                return self._json({"ok": False, "error": "上游拒绝了这次申请"}, 502)
-            if not res.get("state") or not res.get("authUrl"):
-                return self._json({"ok": False, "error": "授权会话没建起来"}, 502)
+                log(f"start failed uid={user['id']} platform={pid} err={exc}")
+                return self._json({"ok": False, "error": "上游拒绝了这次申请：%s" % str(exc)[:80]}, 502)
+            if not res.get("ok"):
+                return self._json({"ok": False, "error": res.get("error") or "授权链接没拿到"}, 502)
             with db() as conn:
-                conn.execute("INSERT OR REPLACE INTO login_states(state,uid,at) VALUES(?,?,?)",
-                             (res["state"], user["id"], time.time()))
-            log(f"start ok uid={user['id']} ip={ip}")
-            return self._json({"ok": True, "state": res["state"], "authUrl": res["authUrl"]})
+                conn.execute("INSERT OR REPLACE INTO login_states(state,uid,at,platform) VALUES(?,?,?,?)",
+                             (res["state"], user["id"], time.time(), pid))
+            log(f"start ok uid={user['id']} platform={pid} ip={ip}")
+            return self._json({"ok": True, "state": res["state"], "authUrl": res["authUrl"],
+                               "platform": pid, "name": e["name"]})
 
         if path == "/api/account/poll":
             state = str(body.get("state") or "").strip()
             if not state:
                 return self._json({"status": "unknown", "message": "缺少 state"}, 400)
+            with db() as conn:
+                row = conn.execute("SELECT platform FROM login_states WHERE state=?", (state,)).fetchone()
+            pid = (row["platform"] if row and row["platform"] else "workbuddy")
+            e = up_by_id(pid)
+            if not e:
+                return self._json({"status": "error", "message": "这家平台已下线"}, 400)
             try:
-                res = api("GET", "/accounts/login/poll", query={"state": state})
+                res = platform_login_poll(e, state)
             except Exception as exc:
                 return self._json({"status": "error", "message": str(exc)[:120]}, 502)
             if str(res.get("status")) == "ok":
-                log(f"joined uid={user['id']}")
-                attribute_account(state)
-            return self._json({"status": res.get("status"), "message": res.get("message", "")})
+                log(f"joined uid={user['id']} platform={pid}")
+                attribute_account(state, pid)
+            return self._json({"status": res.get("status"), "message": res.get("message", ""),
+                               "platform": pid})
 
         if path == "/api/key/create":
             with db() as conn:
@@ -1641,7 +1672,7 @@ class Handler(BaseHTTPRequestHandler):
                 contribs = conn.execute("SELECT count(*) FROM contrib WHERE uid=?", (user["id"],)).fetchone()[0]
             if has:
                 return self._json({"ok": False, "error": "你已经有一个 Key 了"}, 400)
-            if contribs == 0:
+            if contribs == 0 and not is_admin(user):
                 return self._json({"ok": False, "error": "先用「添加账号」贡献一个账号，才能领取 Key"}, 403)
             new_key = "wb-" + secrets.token_urlsafe(24)
             name = f"portal-{user['nickname']}-{user['id']}"

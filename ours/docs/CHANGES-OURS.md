@@ -143,3 +143,18 @@ Qoder 与 Trae 按未接入显示占位；面板页与朋友页都验过，18 �
 
 实测：三家合计 389.59 积分、391 次请求、账号 6 个、剩余 18,716.0、已接入 3/3；
 WorkBuddy 5 个号 18,074.0（已签 5/5）、Qoder 1 个号 642.0（未签到）、Trae 0 个号。
+## 10. 用户端支持多家加号 + 站长免门禁（2026-11-28）
+
+**添加账号页**：从“一家一个按钮”改成**三家各一张卡**（WorkBuddy / Qoder / Trae），每家显示在线状态与
+已有账号数，各自的「添加 X 账号」按钮走 `/join/api/account/start {platform}`，回来后轮询
+`/api/account/poll`，成功即自动刷新。
+
+- 数据库：`contrib` 与 `login_states` 加 `platform` 列（默认 `workbuddy`），启动时自动 ALTER 补列
+- 归属记录按平台分开：`contrib(account_uid, uid, at, platform)`，跨平台不互相去重
+- 加号走的是门户已有的上游适配（先试 `{"platform":"CLI","realm":"cn"}` 再试 `{}`），所以三家共用一套代码
+
+**API Key 门禁**：管理员邮箱（`ADMIN_EMAILS`）不再要求“先贡献账号”，直接可领。
+tyly 已经生成了一把（`portal-tyly-3`），页面上可「显示完整 Key / 复制」。
+
+实测：`/join/accounts` 三张卡都在（WorkBuddy 5 个号 / Qoder 1 个 / Trae 0）；tyly 的 keys 页没有拦截提示、
+直接显示已领取；`/api/account/start` 对 qoder 与 trae 都返回了真实的官方授权链接。
